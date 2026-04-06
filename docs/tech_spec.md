@@ -1,4 +1,4 @@
-# AI Butler — 一期技术方案
+# AI Butler — 一期技术方案 v0.2
 
 > 目标：构建一个具备**持续记忆能力**的个人 AI 助手，能跨会话记住用户偏好、习惯和重要事件，像真正了解你的人一样对话。
 
@@ -7,40 +7,44 @@
 ## 一、整体架构
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    用户消息输入                        │
-└───────────────────────┬─────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                        用户消息输入                          │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   查询路由（Query Router）                    │
+│         规则判断 → 直接反应 / 浅层检索 / 深度检索              │
+└──────────┬────────────────┬────────────────────────────────-┘
+           │                │
+           ▼                ▼
+      [浅层档位]         [深度档位]
+      用户画像文件        向量检索（Qdrant）
+      短期记忆摘要        BM25 关键词检索
+                          融合重排打分
+           │                │
+           └────────┬───────┘
+                    ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Context 组装层                          │
+│   程序记忆（System Prompt，固定）                            │
+│ + 语义记忆（user_profile，每次加载）                         │
+│ + 情景记忆（检索结果，按 token 预算截断）                     │
+│ + 短期记忆（当前会话历史，含压缩摘要段）                      │
+└───────────────────────┬─────────────────────────────────────┘
                         │
                         ▼
-┌─────────────────────────────────────────────────────┐
-│              查询路由模块（Query Router）              │
-│   规则判断 → 直接反应 / 浅层检索 / 深度检索            │
-└──────┬──────────────┬───────────────────────────────┘
-       │              │
-       ▼              ▼
-  [浅层档位]      [深度档位]
-  用户画像JSON    向量检索(Qdrant)
-  最近N轮对话     BM25关键词检索
-                  融合重排打分
-       │              │
-       └──────┬───────┘
-              ▼
-┌─────────────────────────────────────────────────────┐
-│              Context 组装层                           │
-│  程序记忆(System Prompt) + 语义记忆 + 情景记忆 + 工作记忆 │
-└───────────────────────┬─────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                LLM 推理（OpenAI 兼容接口）                    │
+└───────────────────────┬─────────────────────────────────────┘
                         │
                         ▼
-┌─────────────────────────────────────────────────────┐
-│              LLM 推理（OpenAI 兼容接口）               │
-└───────────────────────┬─────────────────────────────┘
-                        │
-                        ▼
-┌─────────────────────────────────────────────────────┐
-│              记忆写入（异步）                          │
-│  重要信息 → Embedding → Qdrant                        │
-│  工具输出 → 压缩 → 文件存储                           │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    回复后异步处理                             │
+│  ① 短期记忆追加落盘（append-only 原文日志）                   │
+│  ② 判断是否触发短期记忆压缩                                   │
+│  ③ 重要信息 → Embedding → Qdrant + 长期记忆文件              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -49,36 +53,34 @@
 
 | 组件 | 选型 | 说明 |
 |------|------|------|
-| **LLM** | 任意兼容 OpenAI 接口的模型（≥ GLM-4 级别） | 推荐智谱 GLM-4-Flash（免费额度大）或 DeepSeek-V3 |
-| **Embedding** | 任意兼容 OpenAI 接口的远程 embedding 服务 | 推荐智谱 embedding-3（免费）或 Jina embeddings |
-| **向量数据库** | Qdrant（Docker 本地部署） | 支持 payload filter + 时间戳，适合记忆衰减打分 |
-| **BM25** | rank_bm25（Python 库） | 纯本地内存运行，无外部依赖 |
-| **框架底座** | ReMe（agentscope-ai/ReMe）| 文件式记忆管理，提供 pre/post reasoning hook |
-| **对话流程** | LangGraph | 状态机清晰，方便后续加梦境模块等复杂流程 |
-| **关系数据库** | ❌ 一期不引入 | 记忆元数据存 Qdrant payload，用户画像存 JSON 文件 |
+| **LLM** | 兼容 OpenAI 接口（≥ GLM-5 级别） | 当前：百度千帆 glm-5，base_url 可配置 |
+| **Embedding** | 兼容 OpenAI 接口的远程服务 | 当前：OpenRouter nvidia/llama-nemotron-embed-vl-1b-v2:free，2048 维 |
+| **向量数据库** | Qdrant（Docker 本地部署） | 长期记忆语义索引，支持 payload filter |
+| **BM25** | rank_bm25（Python 库） | 内存索引，启动时从长期记忆文件重建 |
+| **关系数据库** | ❌ 一期不引入 | 用文件系统 + Qdrant 覆盖所有存储需求 |
 
-### 所需配置项（环境变量）
+### 环境变量（.env，不进 git）
 
 ```env
-# LLM
-LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4   # 或任意 OpenAI 兼容地址
-LLM_API_KEY=your_api_key
-LLM_MODEL=glm-4-flash
+LLM_BASE_URL=https://qianfan.baidubce.com/v2/coding
+LLM_API_KEY=...
+LLM_MODEL=glm-5
 
-# Embedding
-EMB_BASE_URL=https://open.bigmodel.cn/api/paas/v4
-EMB_API_KEY=your_api_key
-EMB_MODEL=embedding-3
+EMB_BASE_URL=https://openrouter.ai/api/v1
+EMB_API_KEY=...
+EMB_MODEL=nvidia/llama-nemotron-embed-vl-1b-v2:free
 
-# Qdrant
 QDRANT_HOST=localhost
 QDRANT_PORT=6333
 QDRANT_COLLECTION=ai_butler_memory
 
-# 记忆参数
-MEMORY_TOP_K=10           # 检索返回条数
-MEMORY_DECAY_LAMBDA=0.01  # 时间衰减系数
-WORKING_MEMORY_TURNS=6    # 工作记忆保留轮数
+# 短期记忆
+SHORT_TERM_SOFT_LIMIT=50000    # token 数超过此值触发压缩
+SHORT_TERM_HARD_LIMIT=150000   # 绝对上限，模型 context window 内
+
+# 长期记忆检索
+MEMORY_TOP_K=10
+MEMORY_DECAY_LAMBDA=0.01
 ```
 
 ---
@@ -86,252 +88,266 @@ WORKING_MEMORY_TURNS=6    # 工作记忆保留轮数
 ## 三、记忆分层设计
 
 ```
-┌──────────────────────────────────────────────────────┐
-│  程序记忆（Procedural Memory）                        │
-│  → System Prompt 常驻，人格/行为模式，基本不变         │
-│  → 存储：prompt 文件                                  │
-├──────────────────────────────────────────────────────┤
-│  语义记忆（Semantic Memory）                          │
-│  → 用户偏好、习惯、人物关系、长期事实                  │
-│  → 存储：user_profile.json（结构化）                  │
-├──────────────────────────────────────────────────────┤
-│  情景记忆（Episodic Memory）                          │
-│  → 具体事件 + 时间戳，可检索                          │
-│  → 存储：Qdrant（向量 + metadata）                    │
-├──────────────────────────────────────────────────────┤
-│  工作记忆（Working Memory）                           │
-│  → 当前对话滚动窗口，最近 N 轮                        │
-│  → 存储：内存（LangGraph state）                      │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  程序记忆（Procedural Memory）                               │
+│  → 人格、行为规范，写死在 System Prompt 里                   │
+│  → 存储：src/prompts/system.txt                              │
+│  → 每次对话固定加载，不参与检索                               │
+├─────────────────────────────────────────────────────────────┤
+│  语义记忆（Semantic Memory）                                 │
+│  → 用户偏好、习惯、人物关系等结构化事实                       │
+│  → 存储：data/user_profile.json                              │
+│  → 每次对话开始时全量加载进 Context                          │
+│  → 由 LLM 在对话中自动识别并更新                             │
+├─────────────────────────────────────────────────────────────┤
+│  情景记忆（Episodic Memory）—— 长期记忆                      │
+│  → 具体事件、对话摘要片段，带时间戳                          │
+│  → 索引：Qdrant（向量检索）+ BM25（关键词检索）              │
+│  → 原文：data/memory_store/YYYY-MM.jsonl（按月分文件）       │
+│  → 按需检索，不全量加载                                      │
+├─────────────────────────────────────────────────────────────┤
+│  短期记忆（Working Memory）—— 当前会话                       │
+│  → 当前会话的完整对话历史（原始轮次 + 压缩摘要段混合）        │
+│  → 存储：内存（运行时）+ data/sessions/<session_id>.jsonl    │
+│  → 全量落盘，进程异常重启时可恢复                            │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### Qdrant 中记忆条目的数据结构
+### 长期记忆存储结构
 
+**Qdrant** 存索引（向量 + metadata）：
 ```json
 {
   "id": "uuid",
-  "vector": [0.1, 0.2, ...],
+  "vector": [/* 2048维 */],
   "payload": {
     "content": "用户提到他不喜欢吃香菜",
-    "context": "讨论午餐时用户说的",
-    "memory_type": "episodic",
+    "context_desc": "2026年4月，讨论午餐时用户提到的饮食偏好",
     "importance": 0.7,
     "created_at": 1712345678,
     "last_accessed_at": 1712345678,
     "access_count": 1,
-    "tags": ["饮食偏好", "用户习惯"]
+    "source_file": "data/memory_store/2026-04.jsonl",
+    "source_line": 42
   }
 }
 ```
 
----
-
-## 四、查询路由模块
-
-一期用**规则判断**，不上分类模型。
-
-### 三档路由逻辑
-
-| 档位 | 触发条件 | Context 构成 | 预期延迟 |
-|------|---------|------------|---------|
-| 🟢 **直接反应** | 指令类（"帮我算一下"）、打招呼、简单闲聊 | System Prompt + 最近 3 轮 | < 100ms |
-| 🟡 **浅层检索** | 涉及用户偏好、近期事件、普通问答 | + user_profile.json + 最近 24h 摘要 | 200~400ms |
-| 🔴 **深度检索** | 含"上次"/"以前"/"记得吗"、人名、情感事件 | + Qdrant 向量检索 + BM25，融合 top-10 | < 2s |
-
-### 触发关键词（规则）
-
-```python
-DEEP_TRIGGERS = [
-    "上次", "之前", "以前", "记得吗", "你还记得",
-    "我说过", "我提过", "上回", "那时候"
-]
-
-DIRECT_TRIGGERS = [
-    "帮我算", "翻译", "今天天气", "几点", "定个闹钟"
-]
+**文件系统** 存原文（source of truth，Qdrant 只是索引）：
 ```
-
-### 动态升级
-
-- 浅层检索 LLM 置信度低（输出包含"我不确定你之前..."）→ 自动升级深度
-- 用户追问"更早的呢"→ 强制深度检索
+data/memory_store/
+  2026-04.jsonl   ← 每行一条 JSON，append-only，永不修改
+  2026-05.jsonl
+  ...
+```
 
 ---
 
-## 五、记忆检索与打分
+## 四、短期记忆管理（核心）
 
-### 检索流程
+### 结构
+
+短期记忆不是纯粹的对话轮次列表，而是**段落混合结构**：
 
 ```
-输入 Query
-  ├── Embedding → Qdrant 向量检索 → top-20 候选
-  └── BM25 分词检索 → top-20 候选
+[摘要段A]    ← 被压缩过的历史，LLM 生成的结构化摘要
+[摘要段B]    ← 可能有多个摘要段（多次压缩）
+[原始轮次]   ← 最近未压缩的对话，保持原文
+[原始轮次]
+[原始轮次]
+```
+
+### 压缩触发条件
+
+```
+短期记忆 token 数 > SHORT_TERM_SOFT_LIMIT（50k）
+  → 触发部分压缩
+```
+
+### 压缩流程
+
+```
+1. 取出最旧的一批原始轮次（直到 token 数减少到 ~30k）
+2. 用 LLM 压缩这批轮次 → 生成结构化摘要段
+3. 将摘要段替换掉原始轮次，插入到短期记忆头部
+4. 同时：从这批轮次中提取重要事件 → 写入长期记忆（Qdrant + 文件）
+5. 更新落盘文件
+```
+
+压缩后的摘要格式（便于 LLM 理解）：
+```
+[对话摘要 2026-04-06 18:00~20:00]
+- 用户讨论了 AI Butler 项目的技术方案
+- 确定了 Qdrant + BM25 混合检索方案
+- LLM 选型：百度千帆 glm-5；Embedding：OpenRouter nvidia
+- 用户偏好直接落地，不喜欢纠结细节参数
+```
+
+### 落盘策略
+
+- 每轮对话结束后，**立即 append** 到 `data/sessions/<session_id>.jsonl`
+- 文件格式：每行一个 JSON，包含 role / content / timestamp / is_summary
+- 进程重启时，从文件恢复短期记忆（加载最后一个 session 文件）
+
+---
+
+## 五、长期记忆写入
+
+### 触发时机
+
+- 短期记忆压缩时：从被压缩的轮次中提取重要事件写入
+- 每轮对话后：对当前这一轮做轻量判断，重要性 > 0.5 则写入
+
+### 写入流程
+
+```
+1. LLM 评估这段内容的重要性（0~1）和类别（事件/偏好/习惯/关系）
+2. 如果是偏好/习惯类 → 更新 user_profile.json（语义记忆）
+3. 如果是事件类且重要性 > 0.5：
+   a. 用 LLM 生成一句 context_desc（Contextual Retrieval 方案）
+   b. 对"[context_desc]\n[content]"做 Embedding
+   c. 写入 Qdrant
+   d. Append 原文到 data/memory_store/YYYY-MM.jsonl
+```
+
+---
+
+## 六、查询路由
+
+三档规则路由，不上分类模型：
+
+| 档位 | 触发条件 | Context 构成 |
+|------|---------|------------|
+| 🟢 直接反应 | 指令类、简单闲聊、数学计算 | System Prompt + 最近 3 轮 |
+| 🟡 浅层检索 | 默认档位 | + user_profile + 短期记忆全部 |
+| 🔴 深度检索 | 含回忆类关键词、人名、情感事件 | + 向量检索 + BM25 融合 top-K |
+
+深度检索触发词：`上次、之前、以前、记得吗、你还记得、我说过、我提过、上回、那时候`
+
+动态升级：LLM 回复中出现"我不太确定你之前..."等不确定表述 → 自动升级深度并补充检索。
+
+---
+
+## 七、长期记忆检索（深度档位）
+
+### 混合检索流程
+
+```
+Query
+  ├── Embedding → Qdrant 向量检索 → top-20
+  └── BM25（内存索引，启动时从 memory_store/*.jsonl 重建）→ top-20
           ↓
        合并去重
           ↓
        融合打分
           ↓
-       返回 top-K
+       top-K 结果
 ```
 
-### 融合打分公式
+### 融合打分
 
 ```
-score = α × semantic_score
-      + β × bm25_score
-      + γ × recency_score
-      + δ × importance_score
+score = 0.4 × semantic_score
+      + 0.3 × bm25_score
+      + 0.2 × recency_score      # exp(-0.01 × Δt天数)
+      + 0.1 × importance_score
 
-其中：
-  recency_score   = exp(-λ × Δt_days)          # 时间衰减，λ=0.01
-  importance_score = base_importance            # 每次被检索命中，+0.05（Hebbian）
-  α=0.4, β=0.3, γ=0.2, δ=0.1                  # 一期默认权重，后续可调
+命中后：importance += 0.05（Hebbian 强化，回写 Qdrant payload）
 ```
 
-### Contextual Retrieval（存储时加上下文）
+### BM25 索引生命周期
 
-写入 Qdrant 前，先用 LLM 给记忆片段生成一句上下文描述，连同原文一起 embed，提升召回率（参考 Anthropic 的做法，召回率提升约 67%）：
+- 启动时：遍历 `data/memory_store/*.jsonl`，加载所有 content 字段，在内存中构建索引
+- 新记忆写入后：增量更新内存索引（直接 append，不重建）
+- 重启后：重新从文件全量构建（文件是 source of truth）
+
+---
+
+## 八、Context 组装与 Token 预算
 
 ```
-原文: "用户说不喜欢吃香菜"
-上下文描述: "这是用户在2026年4月讨论午餐时提到的饮食偏好"
-Embed 内容: "[上下文描述]\n[原文]"
+System Prompt（固定）              ≤ 800  tokens
+user_profile 摘要（每次全量）      ≤ 500  tokens
+长期记忆检索结果（深度档位才有）    ≤ 1500 tokens
+短期记忆（含摘要段 + 最近原始轮次） ≤ 动态（剩余预算）
+当前用户输入                       ≤ 500  tokens
+LLM 回复预留                      ≤ 2000 tokens
+```
+
+短期记忆的 token 占用 = 总预算 - 其他固定部分。超出时从最旧的段落开始丢弃（已有摘要段保护了信息不丢失）。
+
+---
+
+## 九、数据目录结构
+
+```
+data/
+  user_profile.json          ← 语义记忆（用户画像）
+  sessions/
+    <session_id>.jsonl       ← 短期记忆落盘（每个会话一个文件）
+  memory_store/
+    2026-04.jsonl            ← 长期记忆原文（按月，append-only）
+    2026-05.jsonl
+  qdrant_storage/            ← Qdrant 数据目录（Docker volume）
 ```
 
 ---
 
-## 六、Context 组装
-
-### Token 预算分配（以 8K context 为例）
-
-```
-System Prompt（程序记忆）     ≤ 800  tokens
-用户画像摘要（语义记忆）       ≤ 500  tokens
-检索记忆片段（情景记忆）       ≤ 1500 tokens
-工作记忆（最近 6 轮对话）      ≤ 2000 tokens
-当前用户输入                  ≤ 500  tokens
-LLM 回复预留                 ≤ 2700 tokens
-───────────────────────────────────────────
-合计                          ≤ 8000 tokens
-```
-
-### 工具输出压缩
-
-凡是工具返回值超过 200 tokens 的，压缩后存文件，Context 里只放摘要 + 引用路径。防止工具返回撑爆 context。
-
----
-
-## 七、项目目录结构
+## 十、代码目录结构
 
 ```
 AI_Butler/
-├── README.md
 ├── docs/
-│   └── tech_spec.md           ← 本文档
+│   └── tech_spec.md
 ├── src/
-│   ├── main.py                ← 入口，启动对话循环
-│   ├── config.py              ← 从环境变量读取配置
-│   ├── router/
-│   │   └── query_router.py    ← 查询路由（三档规则）
+│   ├── main.py                  ← CLI 入口，对话主循环
+│   ├── config.py                ← 环境变量读取
+│   ├── prompts/
+│   │   └── system.txt           ← 程序记忆（人格定义）
 │   ├── memory/
-│   │   ├── episodic.py        ← 情景记忆：Qdrant 读写
-│   │   ├── semantic.py        ← 语义记忆：user_profile.json
-│   │   ├── working.py         ← 工作记忆：滚动窗口
-│   │   ├── retriever.py       ← 检索器：向量 + BM25 + 融合打分
-│   │   └── writer.py          ← 记忆写入：异步，含 contextual retrieval
+│   │   ├── short_term.py        ← 短期记忆：结构管理 + 压缩触发
+│   │   ├── long_term.py         ← 长期记忆：Qdrant + 文件读写
+│   │   ├── retriever.py         ← 混合检索 + 融合打分
+│   │   └── writer.py            ← 记忆写入决策（重要性判断 + 分流）
+│   ├── router/
+│   │   └── query_router.py      ← 三档路由规则
 │   ├── context/
-│   │   └── assembler.py       ← Context 组装，token 预算管理
-│   ├── llm/
-│   │   ├── client.py          ← OpenAI 兼容客户端封装
-│   │   └── embedding.py       ← Embedding 封装
-│   └── tools/
-│       └── compressor.py      ← 工具输出压缩
-├── data/
-│   ├── user_profile.json      ← 用户画像（语义记忆）
-│   └── memory_files/          ← 压缩后的工具输出存储
-├── docker-compose.yml         ← Qdrant 一键启动
+│   │   └── assembler.py         ← Context 组装 + token 预算管理
+│   └── llm/
+│       ├── client.py            ← LLM 调用封装（流式 + 非流式）
+│       └── embedding.py         ← Embedding 调用封装
+├── data/                        ← 运行时数据（不进 git）
+├── docker-compose.yml           ← Qdrant
 ├── requirements.txt
-└── .env.example
+├── .env                         ← 敏感配置（不进 git）
+└── .env.example                 ← 配置模板
 ```
 
 ---
 
-## 八、部署方式
-
-### 1. 启动 Qdrant
-
-```bash
-docker-compose up -d qdrant
-```
-
-`docker-compose.yml`:
-```yaml
-version: "3"
-services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    ports:
-      - "6333:6333"
-    volumes:
-      - ./data/qdrant_storage:/qdrant/storage
-```
-
-### 2. 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-核心依赖：
-```
-openai>=1.0.0
-qdrant-client>=1.7.0
-rank_bm25>=0.2.2
-langgraph>=0.1.0
-agentscope[remelight]
-tiktoken
-python-dotenv
-```
-
-### 3. 配置环境变量
-
-```bash
-cp .env.example .env
-# 填入 LLM_API_KEY、EMB_API_KEY 等
-```
-
-### 4. 运行
-
-```bash
-python src/main.py
-```
-
----
-
-## 九、一期不做的事（明确边界）
+## 十一、一期不做的事
 
 | 功能 | 推迟到 | 原因 |
 |------|--------|------|
-| 梦境整理模块（异步重写记忆） | 二期 | 一期先积累数据，验证检索效果 |
-| 矛盾检测 / 前摄干扰处理 | 二期 | 需要梦境模块支撑 |
-| Graphiti 时序知识图谱 | 二期 | 依赖 Neo4j，增加部署复杂度 |
-| 查询路由升级为分类模型 | 三期 | 先跑规则，积累数据后再训练 |
-| 预判预取（打字时提前检索） | 三期 | 优化项，一期不是瓶颈 |
-| MySQL 持久化 | 待评估 | Qdrant payload 够用，再观察 |
+| 梦境模块（全局重写记忆） | 二期 | 一期只做部分压缩，梦境做全局去重/矛盾检测 |
+| 矛盾检测 / 前摄干扰处理 | 二期 | 梦境模块负责 |
+| Graphiti 时序图谱 | 二期 | 一期 Qdrant + BM25 够用 |
+| 查询路由升级分类模型 | 三期 | 积累数据后再训练 |
+| 错误处理 / 降级策略 | 待定 | Qdrant 挂了降级为纯短期记忆模式 |
+| 多用户支持 | 待定 | 一期只考虑单用户 |
 
 ---
 
-## 十、一期里程碑
+## 十二、一期里程碑
 
-- [ ] **M1**：Qdrant 初始化 + Embedding 写入读取跑通
-- [ ] **M2**：BM25 检索 + 向量检索 + 融合打分跑通
-- [ ] **M3**：查询路由三档规则实现
-- [ ] **M4**：Context 组装 + Token 预算管理
-- [ ] **M5**：端到端对话跑通（有记忆的完整对话）
-- [ ] **M6**：工具输出压缩实现
-- [ ] **M7**：user_profile.json 自动更新（用户偏好提取）
+- [ ] **M1**：Qdrant 初始化 + Embedding 写入/读取跑通
+- [ ] **M2**：BM25 内存索引构建 + 混合检索 + 融合打分跑通
+- [ ] **M3**：短期记忆管理（结构 + 落盘 + 压缩触发）
+- [ ] **M4**：长期记忆写入（重要性判断 + Contextual Retrieval）
+- [ ] **M5**：查询路由三档规则
+- [ ] **M6**：Context 组装 + Token 预算管理
+- [ ] **M7**：端到端 CLI 对话跑通（有记忆的完整对话）
 
 ---
 
-*文档版本：v0.1 — 2026-04-06*  
-*作者：AI Butler 项目组*
+*v0.2 — 2026-04-06，纳入短期记忆压缩策略、长期记忆两层存储、BM25 索引生命周期、全量落盘方案*
