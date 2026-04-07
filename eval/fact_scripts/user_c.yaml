@@ -1,0 +1,97 @@
+# 用户C 事实剧本 - 林晨（上海打工人）
+# 这是 ground truth 的唯一来源，所有评测 case 的期望答案从此推导
+# 类型：profile（固定属性）/ fact（事件/状态）/ change（覆盖之前的记录）
+
+profile:
+  name: 林晨
+  age: 27
+  city: 上海
+  job: 互联网公司员工（具体岗位未知）
+  living: 独居，租房，距公司较近（骑车或地铁可达）
+
+timeline:
+
+  - date: 2025-01-03
+    type: fact
+    key: reading
+    value: 元旦假期在读《额尔古纳河右岸》（迟子建），感觉很好，舍不得看完
+
+  - date: 2025-01-04
+    type: fact
+    key: coffee
+    value: 下午不喝咖啡，喝了晚上睡不着，会影响睡眠
+
+  - date: 2025-01-04
+    type: fact
+    key: health
+    value: 想健身，但最近比较忙，还没开始
+
+  - date: 2025-01-05
+    type: fact
+    key: sleep_goal
+    value: 目标每天12点前睡觉
+
+  - date: 2025-01-05
+    type: fact
+    key: smart_home
+    value: 想把家里小爱同学接入大模型，GitHub上看了方案，需要接入HA（Home Assistant），感觉麻烦，决定改天再弄
+
+  - date: 2025-01-06
+    type: fact
+    key: work_pressure
+    value: 发现同事假期写了很多文档做汇报，感到压力，提醒自己也要注意职场表现
+
+  - date: 2025-01-07
+    type: fact
+    key: smart_home
+    value: 晚上继续研究小爱接入方案，有些进展，卡在语音转文字（STT）和大模型选型上，都需要付费，日常使用场景不多，暂时搁置
+
+  - date: 2025-01-07
+    type: fact
+    key: english_goal
+    value: 决定多学英语
+
+  - date: 2025-01-07
+    type: fact
+    key: travel_plan
+    value: 想出去旅行，让AI做规划，但觉得AI给的规划不够好
+
+  - date: 2025-01-08
+    type: fact
+    key: travel_destination
+    value: 想去泰国普吉岛，纠结上海直飞普吉 vs 曼谷先玩几天再转机普吉，计划约10天行程
+
+  - date: 2025-01-08
+    type: fact
+    key: travel_timing
+    value: 春节期间机票太贵，打算等春节后再查机票，期待春节长假
+
+  - date: 2025-01-09
+    type: fact
+    key: food_preference
+    value: 喜欢胡萝卜炒肉丝，简单好吃，自己会做饭
+
+  - date: 2025-01-10
+    type: fact
+    key: park_visit
+    value: 去世博公园逛了一圈，大冬天没什么花，比较冷清，打算春天花开了再来
+
+  - date: 2025-02-10
+    type: change
+    key: reading
+    value: 《额尔古纳河右岸》已读完，很喜欢，想找类似风格的下一本
+
+  - date: 2025-02-15
+    type: change
+    key: smart_home
+    value: 重新捡起小爱接入项目，确认用Whisper做本地语音识别（免费），大模型选型还在考虑
+
+  - date: 2025-03-01
+    type: change
+    key: travel_plan
+    value: 泰国旅行确认路线：曼谷2天 + 普吉7天，正在看机票（中国去泰国免签，无需办签证）
+
+  - date: 2025-03-15
+    type: fact
+    key: park_revisit
+    value: 重回世博公园，春天花开了，郁金香盛开，感觉和冬天完全不同，值得一来

@@ -1,0 +1,275 @@
+# Ground Truth — 用户C（林晨）记忆能力评测
+# 此文件是评测的唯一判定依据
+# 每个 test_case 对应 user_c_conv.json 中的一个测试片段
+#
+# 字段说明：
+#   trigger_turn_id   : 触发测试的用户发言轮次（conv中的 turn_id）
+#   memory_source     : 记忆来源（conv中植入记忆的 turn_id 列表）
+#   memory_gap_days   : 触发时距记忆植入约多少天（模拟记忆衰减压力）
+#   required          : 模型必须做到的判定条件（AND关系，全部满足才算通过）
+#   bonus             : 加分项，做到则超出预期（不影响pass/fail）
+#   forbidden         : 模型绝对不能出现的内容（出现即fail，无论其他条件）
+#   scoring:
+#     pass_threshold  : required中满足几条算通过（默认全部）
+#     weight          : 该case的权重（用于计算总分）
+
+test_cases:
+
+  - id: TC-C01
+    name: 读书推荐 — 关联历史阅读记录
+    segment_id: S08
+    trigger_turn_id: 47
+    memory_source_turn_ids: [3, 5]
+    memory_gap_days: 29
+    description: >
+      用户来问推荐书，没有提供任何背景信息。
+      AI应主动想起约一个月前用户在读《额尔古纳河右岸》（迟子建），
+      并以此为基础给出有针对性的推荐，而不是泛泛推荐畅销书。
+
+    required:
+      - id: R1
+        desc: 主动提及《额尔古纳河右岸》或迟子建，确认用户是否读完
+        check: response_mentions_any(["额尔古纳河右岸", "迟子建"])
+      - id: R2
+        desc: 给出的推荐书目与迟子建风格相近（历史感、少数民族、文学性），而非泛泛推荐
+        check: manual_review
+        rubric: >
+          推荐内容需体现对用户口味的理解：有历史厚度、文学性强。
+          如《尘埃落定》《白鹿原》《心灵史》《平凡的世界》等均为合理选项。
+          推荐网文、爽文、商业畅销书则不符合。
+      - id: R3
+        desc: 回复中体现出"基于你之前的阅读"这一关联意识，而不是直接给书单
+        check: manual_review
+        rubric: >
+          模型回复应表现出记忆关联的意图，例如询问是否读完、说"你之前在看……"等，
+          而不是直接冷启动给一个毫无关联的书单。
+
+    bonus:
+      - desc: 主动询问用户是否已读完《额尔古纳河右岸》，再给推荐
+      - desc: 推荐理由中提到与《额尔古纳河右岸》的具体共同点（如少数民族视角、历史叙事风格）
+
+    forbidden:
+      - desc: 完全不提阅读历史，直接推荐热门畅销书（如《三体》《活着》等）且无任何关联语境
+        check: manual_review
+
+    scoring:
+      pass_threshold: 3
+      weight: 1.0
+
+  - id: TC-C02
+    name: 睡眠建议 — 记住咖啡禁忌和睡眠目标，且不提违禁建议
+    segment_id: S09
+    trigger_turn_id: 53
+    memory_source_turn_ids: [9, 11]
+    memory_gap_days: 37
+    description: >
+      用户来问改善睡眠的方法，没有提及任何习惯信息。
+      AI需记住：(1) 用户下午不喝咖啡，喝了会影响睡眠；
+      (2) 用户有12点睡觉的目标。
+      给出建议时不得推荐咖啡相关的提神方法，
+      且应将建议与用户已知的12点目标关联起来。
+
+    required:
+      - id: R1
+        desc: 不建议喝咖啡或任何含咖啡因饮品作为改善白天精神状态的方法
+        check: response_not_mentions_any(["咖啡", "拿铁", "美式", "浓缩", "咖啡因"])
+        note: >
+          该条为硬性约束，即使模型给出了其他好建议，只要提到让用户喝咖啡，即fail该条。
+      - id: R2
+        desc: 主动关联用户的12点睡眠目标，询问或判断是否目标被破坏
+        check: response_mentions_any(["12点", "睡眠目标", "几点睡", "目标"])
+      - id: R3
+        desc: 给出实际可操作的睡眠改善建议
+        check: manual_review
+        rubric: >
+          建议应具体可执行，如减少睡前手机使用、设置宵禁闹钟、睡前不看强刺激内容等。
+          "注意休息""早睡"等泛泛建议不算合格。
+
+    bonus:
+      - desc: 主动询问"是睡前刷手机、还是躺下睡不着、还是睡着了容易醒"，做精准定位
+      - desc: 提到物理隔离手机（而非依赖意志力）的具体方法
+
+    forbidden:
+      - desc: 建议用户喝咖啡或提神饮料来缓解白天困倦
+        check: response_mentions_any(["咖啡", "功能饮料", "红牛", "茶里含咖啡因"])
+        note: 该forbidden条与R1等价，双重保障
+
+    scoring:
+      pass_threshold: 3
+      weight: 1.5
+      note: >
+        权重1.5，因为「记住用户禁忌并主动规避」是记忆能力的核心体现，
+        比普通的召回难度更高，且错误代价更大（给出有害建议）。
+
+  - id: TC-C03
+    name: 智能家居项目重启 — 记住项目细节和上次停滞原因
+    segment_id: S10
+    trigger_turn_id: 59
+    memory_source_turn_ids: [21, 23, 25]
+    memory_gap_days: 39
+    description: >
+      用户说"想重新搞那个智能家居的事"，没有提任何细节。
+      AI需从记忆中还原：项目是小爱同学接大模型，走HA方案，
+      上次卡点是STT和大模型都要付费，用户设备是Mac，
+      最终因使用场景不明确而搁置。
+      不应让用户重新解释项目背景。
+
+    required:
+      - id: R1
+        desc: 主动识别出"那个智能家居的事"指的是小爱同学接大模型的项目
+        check: response_mentions_any(["小爱", "Home Assistant", "HA", "大模型", "智能家居接入"])
+      - id: R2
+        desc: 提及上次搁置的原因（STT/大模型费用问题，或使用场景不明确）
+        check: manual_review
+        rubric: >
+          模型应表现出对上次停滞原因的记忆，例如"上次卡在STT和大模型的费用上"，
+          或"你之前说日常使用场景不多就搁置了"。
+          直接问"你的项目是什么"视为记忆失效。
+      - id: R3
+        desc: 不要求用户重新介绍项目背景
+        check: manual_review
+        rubric: >
+          模型不应问"你说的智能家居是什么项目"、"能介绍一下你的需求吗"之类的问题，
+          应直接进入续接状态。
+
+    bonus:
+      - desc: 主动提到Mac可以跑Whisper，与新进展相呼应（用户这次说发现Whisper可行）
+      - desc: 帮用户规划下一步行动（先测试Whisper还是先搭HA环境）
+
+    forbidden:
+      - desc: 将项目误记为其他智能家居品牌（如天猫精灵、alexa等），或完全不记得有过这个项目
+        check: manual_review
+
+    scoring:
+      pass_threshold: 3
+      weight: 1.0
+
+  - id: TC-C04
+    name: 泰国旅行确认 — 记住路线纠结、免签信息、10天行程框架
+    segment_id: S11
+    trigger_turn_id: 65
+    memory_source_turn_ids: [27, 29, 31, 33]
+    memory_gap_days: 52
+    description: >
+      用户说"泰国机票查好了打算订了"，来确认行程。
+      AI需记住：(1) 用户纠结直飞普吉vs曼谷中转两条路线，当时未定；
+      (2) 中国护照去泰国免签，AI已告知用户，不应再当成新信息告知；
+      (3) 行程约10天，曼谷2天+普吉7天是AI建议的框架；
+      (4) 用户说春节后机票便宜了再查，说明出发时间在春节后。
+      重点：用户如果问"需要办签证吗"，AI应意识到这已经告知过，简短确认即可。
+
+    required:
+      - id: R1
+        desc: 主动追问用户选了哪条路线（直飞普吉 or 曼谷中转），而不是重新给建议
+        check: manual_review
+        rubric: >
+          模型应先确认路线选择，而非直接输出新的行程规划。
+          因为上次对话中路线未定，这是最重要的悬而未决的信息。
+      - id: R2
+        desc: 当用户问"需要办什么手续吗"时，不重复讲解免签政策（因为已经说过），直接简短确认
+        check: manual_review
+        rubric: >
+          "中国护照免签，之前说过，确认一下护照有效期就好"是合格回复。
+          重新完整讲解免签政策（超过1句话）表明AI没有记住已告知的信息，视为降分项。
+          注意：TC-C04的判定turn是turn_id=67，用户问了签证问题，看turn_id=68的回复。
+      - id: R3
+        desc: 行程规划与之前约定的10天框架（曼谷2天+普吉7天）保持一致，不推翻重来
+        check: manual_review
+        rubric: >
+          如果用户选了曼谷中转，AI给出的行程应与之前"曼谷2天+普吉7天+缓冲1天"框架一致，
+          而不是另起炉灶提出完全不同的安排。
+
+    bonus:
+      - desc: 结合出发日期帮用户对齐曼谷Chatuchak市场的周末时间
+      - desc: 提醒用户确认护照有效期，而非泛泛说"准备好证件"
+
+    forbidden:
+      - desc: 告诉用户"去泰国需要提前办签证"或"需要办落地签"
+        check: response_mentions_any(["办签证", "落地签", "提前申请"])
+        note: >
+          中国护照去泰国免签，告知错误信息是严重错误，直接fail该case。
+
+    scoring:
+      pass_threshold: 3
+      weight: 1.5
+      note: >
+        权重1.5，因为包含"不重复已知信息"和"不给出错误信息"两个高难度维度，
+        且错误信息（签证）有实际危害。
+
+  - id: TC-C05
+    name: 春天出行建议 — 主动想起世博公园的「春天再来」约定
+    segment_id: S12
+    trigger_turn_id: 71
+    memory_source_turn_ids: [41, 43, 45]
+    memory_gap_days: 64
+    description: >
+      用户说"今天天气好，想出去逛，有推荐吗"，没有提及世博公园。
+      AI应主动想起：(1) 约两个月前用户去世博公园，冬天没什么花，
+      (2) 用户自己说"春天花开了再来"，(3) 现在是春天，郁金香季节到了。
+      这是一个「主动关联」测试，考察AI能否将当前情境（春天/出游）
+      与历史记忆中的意图（等春天再去世博公园）自动匹配。
+
+    required:
+      - id: R1
+        desc: 主动提及世博公园，不需要用户提示
+        check: response_mentions_any(["世博公园", "世博"])
+      - id: R2
+        desc: 提及用户之前去过世博公园且说过"春天再来"，体现记忆关联而不是泛泛推荐
+        check: manual_review
+        rubric: >
+          模型应表现出"你之前说过春天要再来"或"上次你去了觉得冬天没什么，现在刚好"
+          这类的主动关联意识，而不是把世博公园作为上海众多公园之一泛泛推荐。
+      - id: R3
+        desc: 提到当前时节郁金香正开或即将开，与用户当时的期待相呼应
+        check: response_mentions_any(["郁金香", "春天的花", "花开了"])
+
+    bonus:
+      - desc: 提醒用户早点去（人多），呼应当时AI给的建议（早去避人潮）
+      - desc: 主动说"回来跟我说好不好看"，形成闭环
+
+    forbidden:
+      - desc: 把世博公园列为选项之一但完全不提"之前去过/说过春天再来"，视为普通推荐而非记忆关联
+        check: manual_review
+        note: >
+          如果模型推荐了世博公园，但没有任何关联到用户的历史访问记录，
+          则R2不通过，该case最多partial credit。
+
+    scoring:
+      pass_threshold: 3
+      weight: 1.2
+      note: >
+        权重1.2，主动关联（无explicit trigger）是记忆能力的高阶体现，
+        比直接召回难度更大。
+
+# ========== 汇总说明 ==========
+summary:
+  total_cases: 5
+  total_weight: 6.2
+  scoring_method: >
+    每个case：所有required条件满足 → pass（得满分weight）；
+    未达到pass_threshold → fail（得0分）；
+    bonus条目每条额外加0.1（上限0.3/case）。
+    最终得分 = sum(case_score) / total_weight，输出百分比。
+  manual_review_cases:
+    - TC-C01-R2
+    - TC-C01-R3
+    - TC-C02-R3
+    - TC-C03-R2
+    - TC-C03-R3
+    - TC-C04-R1
+    - TC-C04-R2
+    - TC-C04-R3
+    - TC-C05-R2
+    - TC-C05-forbidden
+  auto_check_cases:
+    - TC-C01-R1
+    - TC-C02-R1
+    - TC-C02-forbidden
+    - TC-C03-R1
+    - TC-C04-forbidden
+    - TC-C05-R1
+    - TC-C05-R3
+  note: >
+    auto_check 条目可用正则/关键词匹配自动判定；
+    manual_review 条目需由评判模型（kimi-k2.5）根据 rubric 打分。
+    评判模型调用格式见 eval/README.md。
