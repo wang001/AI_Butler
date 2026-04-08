@@ -1,0 +1,8 @@
+reme-ai[light]>=0.3.0
+openai>=1.30.0
+python-dotenv>=1.0.0
+tiktoken>=0.7.0
+
+# union-search-skill 基础依赖（no_api_key 分组所需）
+requests>=2.31.0
+lxml>=5.0.0

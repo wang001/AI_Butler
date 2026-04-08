@@ -1,0 +1,3 @@
+[submodule "vendor/union-search-skill"]
+	path = vendor/union-search-skill
+	url = https://github.com/runningZ1/union-search-skill.git
