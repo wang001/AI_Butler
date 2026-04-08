@@ -229,19 +229,31 @@ class ChatHistory:
         if not hit_map:
             return []
 
-        # 打分：score = 命中词数 / 总词数
+        # ── 两阶段打分 ──────────────────────────────────────────
+        # 阶段 1：按关键词命中率初筛 top 20
         n_keywords = len(keywords)
-        scored: list[tuple[float, float, str]] = []
+        pre_scored: list[tuple[float, float, str]] = []
         for msg_id, hits in hit_map.items():
-            score = len(hits) / n_keywords
-            ts = row_cache[msg_id][2]  # ts 字段
-            scored.append((score, ts, msg_id))
+            relevance = len(hits) / n_keywords
+            ts = row_cache[msg_id][2]
+            pre_scored.append((relevance, ts, msg_id))
+        pre_scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        top_candidates = pre_scored[:20]
 
-        # 按 score 降序，同分按时间降序
-        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        # 阶段 2：综合打分 = relevance^α × (β + (1-β) × time_decay)
+        #   - relevance^α (α=1.5)：低相关性有更强惩罚（非线性）
+        #   - time_decay = 1/(1 + age_hours/half_life)：越近越高
+        #   - β=0.6：时间衰减下限，保证高相关性的旧记录不被过度压低
+        # 效果：rel=0.33 时间近→0.19, rel=1.0 时间远(30天)→0.64
+        now = time.time()
+        scored: list[tuple[float, float, float, str]] = []
+        for relevance, ts, msg_id in top_candidates:
+            final = self._compute_final_score(relevance, ts, now)
+            scored.append((final, relevance, ts, msg_id))
+        scored.sort(key=lambda x: x[0], reverse=True)
 
         results = []
-        for score, _ts, msg_id in scored[:limit]:
+        for final, relevance, _ts, msg_id in scored[:limit]:
             row = row_cache[msg_id]
             msg_id, session_id, ts, role_, snippet, offset, length = row
             content = self._read_jsonl_line(offset, length)
@@ -252,10 +264,38 @@ class ChatHistory:
                 "role": role_,
                 "content": content,
                 "snippet": snippet,
-                "score": round(score, 2),
+                "score": round(final, 2),
+                "relevance": round(relevance, 2),
             })
 
         return results
+
+    @staticmethod
+    def _compute_final_score(
+        relevance: float,
+        ts: float,
+        now: float,
+        alpha: float = 1.5,
+        beta: float = 0.6,
+        half_life_hours: float = 72.0,
+    ) -> float:
+        """
+        综合打分：关键词相关性 × 时间衰减。
+
+        公式：final = relevance^α × (β + (1-β) × time_decay)
+          - relevance: 命中关键词比例（0~1）
+          - α > 1: 对低相关性施加超线性惩罚
+          - time_decay = 1 / (1 + age_hours / half_life): 时间越近越接近 1
+          - β: 衰减下限，保证高相关性旧记录不被过度压低
+
+        设计意图：
+          - 相关性是主导因素，时间只做微调
+          - rel=0.3 + 时间近 → 分数仍低（~0.19）
+          - rel=1.0 + 时间远(30天) → 分数仍高（~0.64）
+        """
+        age_hours = max(0.0, (now - ts) / 3600.0)
+        time_decay = 1.0 / (1.0 + age_hours / half_life_hours)
+        return (relevance ** alpha) * (beta + (1.0 - beta) * time_decay)
 
     def _read_jsonl_line(self, offset: int, length: int) -> str:
         """从 JSONL 文件的指定偏移量读取一行，返回 content 字段。"""
