@@ -206,6 +206,10 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# macOS
+.DS_Store
+**/.DS_Store
+
 # AI Butler runtime data
 data/
 .env
