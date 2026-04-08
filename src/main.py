@@ -445,9 +445,25 @@ async def main():
                 # 主动沉淀当前对话到长期记忆
                 # pre_reasoning_hook 只在 context 溢出时才触发沉淀，
                 # 短对话从不溢出，所以需要在退出时显式提交。
-                msgs_for_summary = dicts_to_msgs(messages)
-                if msgs_for_summary:
-                    reme.add_async_summary_task(messages=msgs_for_summary)
+                #
+                # 重要：保留最近 RECENT_RESERVE_CHARS 字符的原始对话不压缩，
+                # 只把更早的部分送去做 summary。避免最近的对话细节被摘要丢失。
+                RECENT_RESERVE_CHARS = 2000
+                clean_msgs = dicts_to_msgs(messages)
+                # 从末尾往前累计字符数，找到切分点：
+                # 保留最近 >= RECENT_RESERVE_CHARS 的原始消息不压缩，
+                # 只把更早的部分送去 summary。
+                # 若整段对话不足 RECENT_RESERVE_CHARS，则全部保留、不压缩。
+                tail_chars = 0
+                split_idx = 0  # 默认不压缩任何消息
+                for i in range(len(clean_msgs) - 1, -1, -1):
+                    tail_chars += len(clean_msgs[i].content or "")
+                    if tail_chars >= RECENT_RESERVE_CHARS:
+                        split_idx = i
+                        break
+                msgs_to_summarize = clean_msgs[:split_idx]
+                if msgs_to_summarize:
+                    reme.add_async_summary_task(messages=msgs_to_summarize)
                 await reme.await_summary_tasks()
                 await reme.close()
         except Exception as e:
