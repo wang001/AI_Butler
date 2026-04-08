@@ -3,6 +3,7 @@ Tool Call 定义 & 执行器
 
 工具列表：
   - search_memory    : 主动检索长期记忆（模型显式发起）
+  - search_history   : 全文检索原始对话日志（SQLite FTS5）
   - get_current_time : 返回当前时间
   - web_search       : 网络搜索（union-search-skill，no_api_key 分组）
 """
@@ -49,6 +50,42 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "search_history",
+            "description": (
+                "在完整的原始对话历史日志中按关键词检索。"
+                "当用户询问过去某次具体对话的细节、某件具体的事情、"
+                "或记忆系统可能遗漏的内容时使用。"
+                "按关键词命中数打分排序：命中越多排越前，不要求全部命中。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "搜索关键词，用空格分隔多个词。"
+                            "必须提取核心名词/实体，不要传整句话。"
+                            "示例：'五一 普吉岛' 而非 '用户五一想去哪里玩'"
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "最多返回条数，默认 8，最大 20",
+                        "default": 8,
+                    },
+                    "role": {
+                        "type": "string",
+                        "enum": ["user", "assistant"],
+                        "description": "可选，只搜索指定角色的消息",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_current_time",
             "description": "返回当前的日期和时间（北京时间）。用户询问时间、日期、星期时调用。",
             "parameters": {
@@ -65,7 +102,7 @@ TOOLS: list[dict] = [
             "description": (
                 "搜索互联网获取实时信息。"
                 "用于查询新闻、天气、价格、最新资讯等训练数据截止后的内容。"
-                "支持 30+ 平台，默认使用无需 API Key 的搜索引擎。"
+                "可通过 platforms 参数指定搜索平台，不同场景应选择合适的平台组合。"
             ),
             "parameters": {
                 "type": "object",
@@ -78,10 +115,19 @@ TOOLS: list[dict] = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "可选，指定搜索平台列表。"
-                            "留空默认使用 no_api_key 分组（百度、Bing、DuckDuckGo 等）。"
-                            "可选平台示例: baidu_direct, duckduckgo_html, brave_direct, "
-                            "github, zhihu, bilibili, youtube"
+                            "指定搜索平台列表，留空则使用默认通用组合。"
+                            "请根据查询意图选择合适的平台：\n"
+                            "【通用搜索引擎】baidu_direct(百度), bing_int_direct(必应国际), brave_direct(Brave)\n"
+                            "【AI 驱动搜索】startpage_direct(隐私友好,Google代理), "
+                            "ecosia_direct(环保搜索引擎), mojeek(独立索引,无追踪)\n"
+                            "【问答/知识】duckduckgo_instant(即时答案,适合事实性问题), "
+                            "wolfram_direct(数学/科学/数据计算)\n"
+                            "【中文资讯】toutiao_direct(今日头条,新闻/热点), "
+                            "sogou_direct(搜狗,微信公众号内容), so360_direct(360搜索)\n"
+                            "【示例】旅游攻略→baidu_direct,sogou_direct; "
+                            "国际新闻→bing_int_direct,brave_direct; "
+                            "科学计算→wolfram_direct; "
+                            "热点事件→toutiao_direct,baidu_direct"
                         ),
                     },
                 },
@@ -96,8 +142,9 @@ TOOLS: list[dict] = [
 class ToolExecutor:
     """持有 reme 实例，负责实际执行每个工具。"""
 
-    def __init__(self, reme: Any):
+    def __init__(self, reme: Any, history: Any = None):
         self.reme = reme
+        self.history = history   # ChatHistory 实例，可为 None（向后兼容）
 
     # 工具结果最大 token 数，超出截断（参考 Claude Code contentReplacementState）
     _RESULT_TOKEN_LIMIT = 800
@@ -130,6 +177,8 @@ class ToolExecutor:
 
         if name == "search_memory":
             result = await self._search_memory(**args)
+        elif name == "search_history":
+            result = self._search_history(**args)
         elif name == "get_current_time":
             result = self._get_current_time()
         elif name == "web_search":
@@ -161,6 +210,38 @@ class ToolExecutor:
         except Exception as e:
             return f"[记忆检索失败: {e}]"
 
+    def _search_history(
+        self,
+        query: str,
+        limit: int = 8,
+        role: str | None = None,
+    ) -> str:
+        """全文检索原始对话日志（SQLite FTS5）。"""
+        if self.history is None:
+            return "[search_history 不可用] 历史日志系统未初始化。"
+        limit = min(limit, 20)
+        try:
+            results = self.history.search(query, limit=limit, role=role)
+        except Exception as e:
+            return f"[search_history 失败] {e}"
+
+        if not results:
+            return f"在对话历史中未找到与「{query}」相关的内容。"
+
+        from datetime import datetime, timezone, timedelta
+        cst = timezone(timedelta(hours=8))
+        lines = [f"在对话历史中找到 {len(results)} 条与「{query}」相关的记录：\n"]
+        for i, r in enumerate(results, 1):
+            dt = datetime.fromtimestamp(r["ts"], tz=cst).strftime("%Y-%m-%d %H:%M")
+            role_label = {"user": "你", "assistant": "Butler", "tool": "工具"}.get(r["role"], r["role"])
+            content = r["content"]
+            # 内容过长时截取前 300 字
+            if len(content) > 300:
+                content = content[:300] + "…"
+            score_tag = f" (匹配度:{r['score']:.0%})" if "score" in r else ""
+            lines.append(f"{i}. [{dt}]{score_tag} {role_label}：{content}")
+        return "\n".join(lines)
+
     def _get_current_time(self) -> str:
         cst = timezone(timedelta(hours=8))
         now = datetime.now(cst)
@@ -179,8 +260,9 @@ class ToolExecutor:
         except ImportError as e:
             return f"[web_search 不可用] union-search-skill 未正确安装: {e}"
 
-        # 默认用 no_api_key 分组，用户可通过参数覆盖
-        search_platforms = platforms or PLATFORM_GROUPS.get("no_api_key", [])
+        # 默认通用搜索引擎（3 个足够覆盖中英文），模型可通过 platforms 指定垂类平台
+        _DEFAULT_PLATFORMS = ["baidu_direct", "bing_int_direct", "brave_direct"]
+        search_platforms = platforms or _DEFAULT_PLATFORMS
 
         try:
             result = await asyncio.wait_for(

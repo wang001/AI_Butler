@@ -21,7 +21,9 @@ class Config:
 
     # 静默检索：相似度 >= 此阈值才把历史记忆注入 system
     # 范围 0~1，越高越严格（减少无关噪声注入）
-    memory_similarity_threshold: float = 0.75
+    # ReMe hybrid search 分数 = vector_score*0.7 + keyword_score*0.3，
+    # 典型有效匹配在 0.5~0.8 之间，0.75 过高会漏掉大量有效召回
+    memory_similarity_threshold: float = 0.5
 
     @classmethod
     def from_env(cls) -> "Config":
