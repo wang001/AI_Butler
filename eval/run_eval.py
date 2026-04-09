@@ -309,12 +309,13 @@ async def run_eval():
         print(f"  触发问题: {trigger_msg[:80]}...")
 
         # ── Step 1: 静默向量检索（与 main.py passive_recall 完全一致）──
+        # 注意：用文件顶部的 SIMILARITY_THRESHOLD（0.5），不用 cfg（0.75 太严格）
         passive_snippets = []
         if not DRY_RUN:
             passive_snippets = await passive_recall(
                 reme=reme,
                 query=trigger_msg,
-                threshold=cfg.memory_similarity_threshold,
+                threshold=SIMILARITY_THRESHOLD,
                 k=PASSIVE_RECALL_K,
             )
         print(f"  ReMe 静默检索: {len(passive_snippets)} 条片段")
@@ -340,11 +341,16 @@ async def run_eval():
 
         if not DRY_RUN:
             # 用一个代理 history 记录工具调用，不写入真实历史
+            # 注意：Python 嵌套类不是闭包，无法直接引用外层变量。
+            # 通过把 tool_calls_made 作为实例属性传入来绕过这个限制。
             class _TrackHistory:
                 """只追踪工具调用名称，不真正写入 JSONL/DB。"""
+                def __init__(self, calls_list: list):
+                    self._calls = calls_list
+
                 def append(self, role: str, content: str):
                     if role == "tool_call":
-                        tool_calls_made.extend(
+                        self._calls.extend(
                             [t.strip() for t in content.split("、") if t.strip()]
                         )
 
@@ -355,7 +361,7 @@ async def run_eval():
                     messages=final_messages,
                     executor=executor,
                     tools=TOOLS,
-                    history=_TrackHistory(),
+                    history=_TrackHistory(tool_calls_made),
                 )
                 butler_answer = reply or ""
             except Exception as e:
