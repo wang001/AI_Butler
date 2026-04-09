@@ -14,7 +14,7 @@ class Config:
     emb_api_key: str = ""
     emb_model: str = ""
 
-    working_dir: str = "data/.reme"
+    working_dir: str = "/data/memory"
     max_input_length: int = 128000
     compact_ratio: float = 0.7
     memory_compact_reserve: int = 10000
@@ -25,6 +25,16 @@ class Config:
     # 典型有效匹配在 0.5~0.8 之间，0.75 过高会漏掉大量有效召回
     memory_similarity_threshold: float = 0.5
 
+    # ── 命令执行配置（容器内直接 subprocess 执行） ──
+    command_enabled: bool = True
+    command_workdir: str = "/workspace"
+    command_default_timeout: int = 30
+
+    # ── browser-use 配置 ──
+    browser_enabled: bool = True
+    browser_headless: bool = True
+    browser_max_steps: int = 20
+
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
@@ -34,7 +44,14 @@ class Config:
             emb_base_url=os.getenv("EMB_BASE_URL", ""),
             emb_api_key=os.getenv("EMB_API_KEY", ""),
             emb_model=os.getenv("EMB_MODEL", ""),
+            working_dir=os.getenv("WORKING_DIR", "/data/memory"),
             memory_similarity_threshold=float(
                 os.getenv("MEMORY_SIMILARITY_THRESHOLD", "0.75")
             ),
+            command_enabled=os.getenv("COMMAND_ENABLED", "true").lower() == "true",
+            command_workdir=os.getenv("COMMAND_WORKDIR", "/workspace"),
+            command_default_timeout=int(os.getenv("COMMAND_DEFAULT_TIMEOUT", "30")),
+            browser_enabled=os.getenv("BROWSER_ENABLED", "true").lower() == "true",
+            browser_headless=os.getenv("BROWSER_HEADLESS", "true").lower() == "true",
+            browser_max_steps=int(os.getenv("BROWSER_MAX_STEPS", "20")),
         )

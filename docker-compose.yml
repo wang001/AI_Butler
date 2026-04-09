@@ -1,0 +1,44 @@
+# AI Butler — Docker Compose 配置
+#
+# 目录架构（三层隔离）：
+#
+#   /app          只读   应用代码 + 依赖（镜像内置，不挂载）
+#   /data         读写   持久化数据（记忆、日志、向量库）
+#   /workspace    读写   工作区（Agent 命令执行、用户文件）
+#
+# 使用:
+#   docker-compose up --build      首次构建并启动
+#   docker-compose up              后续直接启动
+#   docker-compose down            停止
+
+services:
+  butler:
+    build: .
+    image: ai-butler:latest
+    container_name: ai-butler
+
+    # 交互模式（CLI 需要 tty + stdin）
+    stdin_open: true
+    tty: true
+
+    # ── 卷挂载 ──
+    # /app 是镜像内置的只读应用层，不需要挂载
+    # 只挂载两个可写目录：
+    volumes:
+      - ./data:/data                # 持久化数据（记忆/日志/向量库）
+      - ./workspace:/workspace      # 工作区（Agent 命令执行读写）
+
+    # ── 环境变量（从 .env 文件加载） ──
+    env_file:
+      - .env
+
+    # ── 资源限制 ──
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+
+    # ── 安全 ──
+    security_opt:
+      - no-new-privileges

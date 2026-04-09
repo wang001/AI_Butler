@@ -239,7 +239,11 @@ async def run_tool_call_loop(
         }
         new_messages.append(tool_call_msg)
 
-        # 并发执行所有 tool call（与 Claude Code StreamingToolExecutor 思路一致）
+        # 按并发安全性分批执行 tool calls
+        # 规则：按模型输出顺序扫描，相邻的并发安全工具合并为一批并行执行，
+        #       遇到非并发安全工具则独立为一批串行执行。
+        from tools import TOOL_CONCURRENT_SAFE
+
         tool_names = [tc.function.name for tc in msg.tool_calls]
         for name in tool_names:
             safe_print(f"\n[工具调用] {name}")
@@ -247,19 +251,41 @@ async def run_tool_call_loop(
         if history is not None:
             history.append("tool_call", "、".join(tool_names))
 
+        # 分批：相邻可并行的合为一组，不可并行的各自独占一组
+        batches: list[list] = []
+        for tc in msg.tool_calls:
+            is_safe = TOOL_CONCURRENT_SAFE.get(tc.function.name, False)
+            if is_safe and batches and all(
+                TOOL_CONCURRENT_SAFE.get(t.function.name, False) for t in batches[-1]
+            ):
+                # 当前工具可并行，且上一批也全是可并行的 → 合入
+                batches[-1].append(tc)
+            else:
+                # 新开一批（不可并行工具独占，或首个工具）
+                batches.append([tc])
+
         async def _exec_one(tc):
             result = await executor.run(tc.function.name, tc.function.arguments)
             safe_print(f"[工具结果:{tc.function.name}] {result[:200]}{'...' if len(result) > 200 else ''}")
             return tc.id, result
 
-        results = await asyncio.gather(*[_exec_one(tc) for tc in msg.tool_calls])
-
-        for tool_call_id, result in results:
-            new_messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": result,
-            })
+        # 逐批执行：批内并行，批间串行
+        for batch in batches:
+            if len(batch) == 1:
+                tid, result = await _exec_one(batch[0])
+                new_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tid,
+                    "content": result,
+                })
+            else:
+                results = await asyncio.gather(*[_exec_one(tc) for tc in batch])
+                for tid, result in results:
+                    new_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "content": result,
+                    })
 
     # 超过最大轮次，强制不带工具再请求一次
     response = await llm_create_with_retry(
@@ -297,7 +323,9 @@ async def stream_final_reply(
 
 async def main():
     cfg = Config.from_env()
-    system_prompt = Path("src/prompts/system.txt").read_text(encoding="utf-8")
+    # system.txt 位于源码目录中，通过 __file__ 定位（兼容容器内 /app 和本地开发）
+    _src_dir = Path(__file__).parent
+    system_prompt = (_src_dir / "prompts" / "system.txt").read_text(encoding="utf-8")
 
     session = PromptSession()
 
@@ -355,7 +383,40 @@ async def main():
                     enable_load_env=False,
                 )
                 await reme.start()
-                executor = _ToolExecutor(reme, history=history)
+
+                # 初始化命令执行器（容器内直接通过 subprocess 执行）
+                sandbox = None
+                if cfg.command_enabled:
+                    try:
+                        from sandbox import CommandExecutor, CommandConfig
+                        sandbox = CommandExecutor(CommandConfig(
+                            workdir=cfg.command_workdir,
+                            default_timeout=cfg.command_default_timeout,
+                        ))
+                    except Exception as e:
+                        safe_print(f"[命令执行器初始化跳过] {e}")
+
+                # 初始化 browser-use Agent
+                browser_agent = None
+                if cfg.browser_enabled:
+                    try:
+                        from browser import BrowserAgent, BrowserUseConfig
+                        browser_agent = BrowserAgent(BrowserUseConfig(
+                            headless=cfg.browser_headless,
+                            max_steps=cfg.browser_max_steps,
+                            llm_model=cfg.llm_model,
+                            llm_base_url=cfg.llm_base_url,
+                            llm_api_key=cfg.llm_api_key,
+                        ))
+                    except Exception as e:
+                        safe_print(f"[浏览器初始化跳过] {e}")
+
+                executor = _ToolExecutor(
+                    reme,
+                    history=history,
+                    sandbox=sandbox,
+                    browser_agent=browser_agent,
+                )
                 TOOLS_LIST = _TOOLS
             else:
                 from tools import TOOLS as TOOLS_LIST  # noqa: F811
@@ -438,6 +499,13 @@ async def main():
                 if messages and messages[-1]["role"] == "user":
                     messages.pop()
                 continue
+
+        # 清理浏览器资源
+        if executor and hasattr(executor, 'browser_agent') and executor.browser_agent:
+            try:
+                await executor.browser_agent.close()
+            except Exception:
+                pass
 
         safe_print("\n正在保存记忆...")
         try:

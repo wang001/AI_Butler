@@ -1,626 +1,492 @@
+# -*- coding: utf-8 -*-
 """
-AI管家记忆系统评测脚本
-- 被测模型（AI管家）：glm-5
+AI管家记忆系统评测脚本 v4
+- 评测模式：内联复用 main.py 完整流程（含 tool call loop、passive_recall）
+- 被测模型：从 .env 读取（llm_model）
 - 评判模型：kimi-k2.5
-- 评测数据：eval-dataset-v1.md
+
+前置步骤：
+  python eval/replay.py       # 重放历史对话写入 ReMe（评测专用路径）
+  python eval/run_eval.py     # 正式评测
+
+评测流程（每个 TC）：
+  1. pre_reasoning_hook（与生产一致，但 messages 为空，主要触发静默初始化）
+  2. passive_recall：静默向量检索（与 main.py 完全一致）
+  3. 读取评测专用 MEMORY.md
+  4. assembler.build 组装 messages
+  5. run_tool_call_loop：被测模型可主动调用 search_memory / search_history 等工具
+  6. 评判模型打分
+
+用法：
+  python eval/run_eval.py
+  python eval/run_eval.py --dry-run   # 不调 API，只检查流程
 """
 
-import os
+import asyncio
+import glob
 import json
+import os
 import re
-import requests
+import sys
+import yaml
+import warnings
+from pathlib import Path
 from datetime import datetime
 
-# ── 配置 ──────────────────────────────────────────────
-API_TOKEN = os.environ.get("QIANFAN_TOKEN", "")
-BASE_URL = "https://qianfan.baidubce.com/v2/coding/chat/completions"
-BUTLER_MODEL = "glm-5"
+# 屏蔽 chromadb 在 Python 3.14 上的 DeprecationWarning
+warnings.filterwarnings(
+    "ignore",
+    message="'asyncio.iscoroutinefunction' is deprecated",
+    category=DeprecationWarning,
+    module="chromadb",
+)
+
+# ── 路径设置 ───────────────────────────────────────────────────────────────
+REPO_ROOT = Path(__file__).parent.parent
+SRC_DIR = REPO_ROOT / "src"
+EVAL_DIR = Path(__file__).parent
+EVAL_DATA_DIR = EVAL_DIR / "eval_data" / "memory"
+DAILY_DIR = EVAL_DIR / "conversations" / "user_c_daily"
+GT_FILE = EVAL_DIR / "ground_truth" / "user_c_gt.yaml"
+OUTPUT_FILE = EVAL_DIR / "eval-results-user-c.json"
+
+sys.path.insert(0, str(SRC_DIR))
+
+from dotenv import load_dotenv
+load_dotenv(REPO_ROOT / ".env")
+
+from config import Config
+from assembler import build
+from history import ChatHistory
+
+# 从 main.py 内联复用关键函数
+import importlib.util
+_main_spec = importlib.util.spec_from_file_location("main_module", SRC_DIR / "main.py")
+_main_module = importlib.util.module_from_spec(_main_spec)
+# 不执行 __main__ 块，只加载模块定义
+_main_spec.loader.exec_module(_main_module)
+
+passive_recall = _main_module.passive_recall
+run_tool_call_loop = _main_module.run_tool_call_loop
+dicts_to_msgs = _main_module.dicts_to_msgs
+msgs_to_dicts = _main_module.msgs_to_dicts
+
+# ── 配置 ───────────────────────────────────────────────────────────────────
+DRY_RUN = "--dry-run" in sys.argv
+
 JUDGE_MODEL = "kimi-k2.5"
-EVAL_FILE = os.path.join(os.path.dirname(__file__), "eval-dataset-v1.md")
-OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "eval-results.json")
-CURRENT_DATE = "2026-04-07"  # 系统时间注入（方案一：时间戳注入）
-
-# ── 评测Cases（手动提取自 eval-dataset-v1.md）─────────
-# 格式：{id, type, user, memories(list of str), query, expected, trap}
-EVAL_CASES = [
-    # ═══ 用户A - 简单召回 ═══
-    {
-        "id": "A-001", "type": "简单召回", "user": "A",
-        "memories": [
-            "[2026-03-20] 事实 用户正式投递了字节跳动后端岗位简历，说'试试看，反正不亏'。",
-            "[2026-03-28] 事实 用户参加了字节跳动一面，说题目中等难度，手撕了一道链表题，系统设计聊了消息队列，感觉发挥正常。",
-            "[2026-03-30] 事实 用户收到字节二面通知，约在4月8日，说'没想到能过一面，有点意外'。",
-        ],
-        "query": "我字节的面试进行到哪一步了？",
-        "expected": "已经过了一面，二面约在4月8日，用户对能过一面感到意外。",
-        "trap": "可能混淆一面和二面状态，或忘记具体日期。",
-    },
-    {
-        "id": "A-002", "type": "简单召回", "user": "A",
-        "memories": [
-            "[2026-03-15] 习惯 用户说最近两周睡眠明显改善，基本能在12点前入睡，'可能是运动的原因'。",
-        ],
-        "query": "我最近睡眠怎么样？",
-        "expected": "最近两周睡眠改善，基本12点前入睡，用户自己觉得可能是运动带来的效果。",
-        "trap": "可能召回早期记忆（1月说过失眠），忽略最新状态。",
-    },
-    {
-        "id": "A-003", "type": "简单召回", "user": "A",
-        "memories": [
-            "[2026-03-10] 事实 用户说DDIA终于读完了，'花了两个多月，最难啃的是分布式事务那章，读了三遍才懂'。",
-        ],
-        "query": "DDIA我读完了吗？",
-        "expected": "读完了，花了两个多月，最难的是分布式事务章节，读了三遍。",
-        "trap": "可能召回早期'读到第四章'的记忆，误报未读完。",
-    },
-    {
-        "id": "A-004", "type": "简单召回", "user": "A",
-        "memories": [
-            "[2026-03-22] 偏好 用户说最近在玩《塞尔达传说：王国之泪》，'之前买了一直没拆封，现在一发不可收拾，每天玩到2点'。",
-        ],
-        "query": "我最近在玩什么游戏？",
-        "expected": "在玩《塞尔达传说：王国之泪》，之前买了没拆，最近开始玩，每天玩到凌晨2点。",
-        "trap": "可能召回早期王者荣耀的记忆。",
-    },
-    {
-        "id": "A-005", "type": "简单召回", "user": "A",
-        "memories": [
-            "[2026-03-25] 习惯 用户说英语练习重新捡起来了，'这次换了方式，不练对话了，改成每天精读一篇英文技术博客，感觉更实用'。",
-        ],
-        "query": "我现在英语是怎么练的？",
-        "expected": "改成每天精读一篇英文技术博客，放弃了之前的对话练习方式。",
-        "trap": "可能召回早期'每天晚上9点练对话'的习惯，给出过时答案。",
-    },
-
-    # ═══ 用户A - 跨时间召回 ═══
-    {
-        "id": "A-006", "type": "跨时间召回", "user": "A",
-        "memories": [
-            "[2026-01-07] 偏好 用户表示不喜欢喝咖啡，说'咖啡喝了心跳快，宁愿喝茶，最近在喝铁观音'。",
-        ],
-        "query": "我好像跟你说过我喜欢喝什么茶来着？",
-        "expected": "用户在1月提过喝铁观音，因为不喜欢咖啡（喝了心跳快）。",
-        "trap": "时间久远（2个月前），系统可能未召回或召回不准确。",
-    },
-    {
-        "id": "A-007", "type": "跨时间召回", "user": "A",
-        "memories": [
-            "[2026-01-09] 事实 用户提到公司技术分享，主题是'MySQL 索引优化'，在准备PPT。",
-            "[2026-01-11] 事实 用户反馈技术分享顺利，反响不错，有同事问了好问题。",
-        ],
-        "query": "我之前做过技术分享吗？讲的什么？",
-        "expected": "做过，主题是MySQL索引优化，反响不错，有同事提问。",
-        "trap": "事情发生在1月，3个月前，可能衰减过度导致召回失败。",
-    },
-    {
-        "id": "A-008", "type": "跨时间召回", "user": "A",
-        "memories": [
-            "[2026-01-05] 习惯 用户说每天晚上11点之前睡觉是他的目标，但最近因为看技术书经常拖到凌晨1点。",
-        ],
-        "query": "我一开始给自己定的睡觉时间目标是几点？",
-        "expected": "目标是晚上11点前睡，但当时因为看技术书经常到凌晨1点。",
-        "trap": "这是用户的初始目标，系统可能混淆后来的睡眠状态记忆。",
-    },
-    {
-        "id": "A-009", "type": "跨时间召回", "user": "A",
-        "memories": [
-            "[2026-01-06] 情绪 用户抱怨公司代码review文化太差，同事提PR随手approve，出bug才来抱怨。",
-        ],
-        "query": "我之前吐槽过公司什么问题？",
-        "expected": "吐槽过代码review文化差，同事PR随手approve，出bug才来抱怨，当时心情很烦。",
-        "trap": "情绪类记忆时间久，且后续没有更新，可能未被召回。",
-    },
-    {
-        "id": "A-010", "type": "跨时间召回", "user": "A",
-        "memories": [
-            "[2026-01-07] 偏好 用户说想学英语，目标是'能看英文技术文档不卡壳'，希望每天和管家练15分钟英语对话。",
-            "[2026-01-08] 习惯 用户开始和管家每天晚上9点练英语，第一天练了'自我介绍'和'描述工作内容'。",
-        ],
-        "query": "我当初学英语的目标是什么？",
-        "expected": "目标是能看英文技术文档不卡壳，最初每天晚上9点练15分钟对话。",
-        "trap": "需要区分初始目标和后来改变的练习方式，不能混淆。",
-    },
-
-    # ═══ 用户A - 矛盾信息处理 ═══
-    {
-        "id": "A-011", "type": "矛盾信息处理", "user": "A",
-        "memories": [
-            "[2026-01-07] 偏好 用户表示不喜欢喝咖啡，说'咖啡喝了心跳快，宁愿喝茶'。",
-            "[2026-03-05] 偏好 用户说'最近开始喝咖啡了，发现美式加冰还挺好喝的，早上喝一杯提神'。",
-        ],
-        "query": "我喝咖啡吗？",
-        "expected": "现在喝，最近开始喝美式加冰，早上提神用。之前1月时说不喜欢咖啡，现在改变了。",
-        "trap": "系统可能只返回旧记忆（不喝咖啡），或只返回新记忆而不提及变化，正确答案是以新为准并说明有过变化。",
-    },
-    {
-        "id": "A-012", "type": "矛盾信息处理", "user": "A",
-        "memories": [
-            "[2026-01-08] 习惯 用户开始每天晚上9点和管家练英语对话。",
-            "[2026-02-10] 习惯 用户说英语练习断了，'过年回家就没练了，回来之后懒得捡'。",
-            "[2026-03-25] 习惯 用户说英语练习重新捡起来了，改成每天精读英文技术博客。",
-        ],
-        "query": "我现在还在练英语吗？",
-        "expected": "在练，但方式变了。从对话练习→中断→现在改成精读英文技术博客，是最新状态。",
-        "trap": "系统可能停在'中断'状态，没有召回最新的恢复记录。",
-    },
-    {
-        "id": "A-013", "type": "矛盾信息处理", "user": "A",
-        "memories": [
-            "[2026-01-12] 习惯 用户提到每周日下午和大学室友开黑打王者荣耀。",
-            "[2026-03-22] 偏好 用户说最近在玩塞尔达，每天玩到凌晨2点。",
-        ],
-        "query": "我现在主要玩什么游戏？",
-        "expected": "最近主要玩塞尔达（王国之泪），每天玩到凌晨2点。之前有和室友打王者的习惯，但最新状态是沉迷塞尔达。",
-        "trap": "两条记忆都有效，但应以最新的为主，并说明变化。",
-    },
-    {
-        "id": "A-014", "type": "矛盾信息处理", "user": "A",
-        "memories": [
-            "[2026-01-05] 习惯 用户睡眠目标是11点前，但实际经常到凌晨1点。",
-            "[2026-02-15] 情绪 用户说因为买了健身环开始锻炼，但睡眠反而更乱了，'运动完太兴奋睡不着'。",
-            "[2026-03-15] 习惯 用户说最近两周睡眠明显改善，基本能在12点前入睡。",
-        ],
-        "query": "我睡眠情况怎么样？",
-        "expected": "最近改善了，基本12点前入睡。经历了三个阶段：目标11点但实际1点→运动后反而睡不好→最近改善到12点前。",
-        "trap": "有三条矛盾记忆，系统需要按时间线整合，给出最新状态而非早期状态。",
-    },
-    {
-        "id": "A-015", "type": "矛盾信息处理", "user": "A",
-        "memories": [
-            "[2026-02-01] 习惯 用户说打算开始每天早上跑步，'买了跑鞋，明天开始'。",
-            "[2026-02-10] 习惯 用户说跑步计划执行了一周就放弃了，'太冷了，早上根本起不来'。",
-            "[2026-02-20] 习惯 用户说买了Switch健身环，'在室内运动，不用忍受寒风了'。",
-            "[2026-03-22] 偏好 用户说最近塞尔达一发不可收拾，健身环落灰了。",
-        ],
-        "query": "我现在有在运动吗？",
-        "expected": "目前没有，健身环落灰了，在玩塞尔达。经历了：跑步计划→放弃→健身环→现在又放弃了。",
-        "trap": "运动状态经历多次变化，系统容易停在某个中间状态（比如'在用健身环'），需要召回最新记录。",
-    },
-
-    # ═══ 用户A - 信息衰减 ═══
-    {
-        "id": "A-016", "type": "信息衰减", "user": "A",
-        "memories": [
-            "[2026-01-09] 事实 用户说下周（1月26日那周）要参加公司内部技术分享，主题MySQL索引优化，在准备PPT。",
-            "[2026-01-11] 事实 用户反馈技术分享顺利结束，反响不错。",
-        ],
-        "query": "我技术分享准备好了吗？",
-        "expected": "技术分享早就结束了（1月底），反响不错。这不是当前需要准备的事，已是过去式。",
-        "trap": "系统可能把'准备PPT'当成当前进行中的任务，忽略后续已完成的记录。",
-    },
-    {
-        "id": "A-017", "type": "信息衰减", "user": "A",
-        "memories": [
-            "[2026-02-01] 习惯 用户说打算明天开始每天早上跑步。",
-            "[2026-02-10] 习惯 用户说跑步计划执行了一周就放弃了。",
-        ],
-        "query": "提醒我明天早上跑步。",
-        "expected": "用户之前的跑步计划2月初就放弃了，当前没有跑步习惯，不应简单答应提醒，应先确认用户是否重新开始跑步。",
-        "trap": "系统可能直接答应设置提醒，忽略该计划已废弃的记录。",
-    },
-    {
-        "id": "A-018", "type": "信息衰减", "user": "A",
-        "memories": [
-            "[2026-01-08] 习惯 用户开始每天晚上9点和管家练英语对话。",
-            "[2026-02-10] 习惯 用户说英语练习断了，过年回家就没练了。",
-        ],
-        "query": "今晚9点我们练英语吧。",
-        "expected": "英语对话练习在2月已中断，且后来改成了精读博客方式。应询问用户是想恢复对话练习还是继续精读方式，而不是直接说'好的，9点见'。",
-        "trap": "系统可能基于早期习惯直接答应，忽略中断记录和方式变化。",
-    },
-    {
-        "id": "A-019", "type": "信息衰减", "user": "A",
-        "memories": [
-            "[2026-02-20] 习惯 用户买了Switch健身环，说'在室内运动'。",
-            "[2026-03-22] 偏好 用户说健身环落灰了，在玩塞尔达。",
-        ],
-        "query": "我健身环今天练了吗？",
-        "expected": "健身环最近落灰了，用户在玩塞尔达。应如实反映，不要假设用户还在用健身环。",
-        "trap": "系统可能基于'买了健身环在运动'的记忆，误以为这是当前习惯。",
-    },
-    {
-        "id": "A-020", "type": "信息衰减", "user": "A",
-        "memories": [
-            "[2026-01-04] 事实 用户正在读DDIA，读到第四章。",
-            "[2026-03-10] 事实 用户说DDIA终于读完了。",
-        ],
-        "query": "我DDIA读到哪章了？",
-        "expected": "DDIA已经在3月读完了，不存在'读到哪章'的问题，应告知已读完。",
-        "trap": "系统可能召回早期'读到第四章'的记录，给出过时答案。",
-    },
-
-    # ═══ 用户B - 简单召回 ═══
-    {
-        "id": "B-001", "type": "简单召回", "user": "B",
-        "memories": [
-            "[2026-03-20] 情绪 用户说沈辞最近接了好几个广告，觉得'有点失望，感觉他变了，不像以前那么纯粹'。",
-            "[2026-03-28] 情绪 用户说'还是会继续关注沈辞，但没有以前那么狂热了，理性追星吧'。",
-        ],
-        "query": "我现在对沈辞什么感觉？",
-        "expected": "还在关注，但没以前狂热了，转向理性追星。因为他接了很多广告让用户有点失望。",
-        "trap": "可能召回早期无条件喜欢的记忆，忽略近期情感变化。",
-    },
-    {
-        "id": "B-002", "type": "简单召回", "user": "B",
-        "memories": [
-            "[2026-03-15] 习惯 用户说返校后重新开始健身，从每天早上一次变成了一天两次（早上和晚上各一次）。",
-        ],
-        "query": "我现在每天健身几次？",
-        "expected": "一天两次，早上和晚上各一次，返校后开始的新节奏。",
-        "trap": "可能召回寒假前'每天早上一次'的记录。",
-    },
-    {
-        "id": "B-003", "type": "简单召回", "user": "B",
-        "memories": [
-            "[2026-03-25] 事实 用户说论文初稿交了，'导师说框架可以，但文献综述太薄，需要补'。",
-        ],
-        "query": "我论文现在什么情况？",
-        "expected": "初稿已交，导师说框架可以，但文献综述太薄需要补充。",
-        "trap": "可能召回选题阶段的记忆，误报论文还在选题。",
-    },
-    {
-        "id": "B-004", "type": "简单召回", "user": "B",
-        "memories": [
-            "[2026-03-18] 情绪 用户说在健身房路上碰到一只橘猫，跟着她走了半条街，'太可爱了，差点带回宿舍'。",
-        ],
-        "query": "我最近有没有跟你分享过什么有趣的事？",
-        "expected": "分享过在健身路上遇到一只橘猫，跟着她走了半条街，差点带回宿舍。",
-        "trap": "日常分享类记忆容易被系统当作低权重信息忽略。",
-    },
-    {
-        "id": "B-005", "type": "简单召回", "user": "B",
-        "memories": [
-            "[2026-03-10] 偏好 用户说开始看新剧《玫瑰战争》，'节奏很快，女主很飒，感觉会追完'。",
-            "[2026-03-22] 情绪 用户说《玫瑰战争》结局太烂了，'前面铺垫这么多，结局草草了事，差评'。",
-        ],
-        "query": "《玫瑰战争》我看完了吗？好看吗？",
-        "expected": "看完了，结局烂，差评。前面节奏快女主飒，但结局草草了事，总体失望。",
-        "trap": "可能只召回开始看时的正面评价，忽略结局差评。",
-    },
-
-    # ═══ 用户B - 跨时间召回 ═══
-    {
-        "id": "B-006", "type": "跨时间召回", "user": "B",
-        "memories": [
-            "[2026-01-10] 偏好 用户说最喜欢沈辞的一首歌是《漂流瓶》，'每次心情不好都听这首，百听不厌'。",
-        ],
-        "query": "我之前说过沈辞哪首歌我最喜欢？",
-        "expected": "《漂流瓶》，心情不好时听，百听不厌。",
-        "trap": "时间久远（1月），可能衰减过度未被召回。",
-    },
-    {
-        "id": "B-007", "type": "跨时间召回", "user": "B",
-        "memories": [
-            "[2026-01-15] 习惯 用户说她每天早上跑步30分钟，'在学校操场，一边听播客一边跑，很解压'。",
-        ],
-        "query": "我之前健身是怎么个习惯？",
-        "expected": "寒假前在学校每天早上跑步30分钟，在操场一边听播客一边跑，觉得解压。",
-        "trap": "需要和后来的健身房习惯区分，这是最初的运动方式。",
-    },
-    {
-        "id": "B-008", "type": "跨时间召回", "user": "B",
-        "memories": [
-            "[2026-01-05] 情绪 用户兴奋分享：沈辞在某综艺节目里弹吉他唱歌，'帅死了，这个片段我反复看了10遍'。",
-        ],
-        "query": "我好像跟你提过沈辞在综艺里做了什么很帅的事？",
-        "expected": "在某综艺里弹吉他唱歌，用户反复看了10遍，觉得很帅。",
-        "trap": "娱乐八卦类记忆可能被认为是低价值信息而衰减，导致无法召回。",
-    },
-    {
-        "id": "B-009", "type": "跨时间召回", "user": "B",
-        "memories": [
-            "[2026-01-20] 事实 用户说期末考试下周开始，有三门：高数、英语、专业课（数据结构），最担心高数。",
-            "[2026-01-30] 事实 用户说考试结束了，高数考得'不算惨，估计能过'，英语超常发挥，数据结构不确定。",
-        ],
-        "query": "我上学期期末考得怎么样？",
-        "expected": "高数不算惨估计能过，英语超常发挥，数据结构不确定。最担心高数，结果还好。",
-        "trap": "跨越两条记忆，且时间久（1月），需要整合考前和考后两条信息。",
-    },
-    {
-        "id": "B-010", "type": "跨时间召回", "user": "B",
-        "memories": [
-            "[2026-01-25] 情绪 用户说沈辞被爆料在和圈内某女明星恋爱，'心碎了，感觉好难受，虽然知道爱豆会谈恋爱但还是接受不了'。",
-            "[2026-02-03] 事实 用户说恋爱爆料被辟谣了，'经纪公司声明是恶意造谣，松了口气，但也觉得自己当时的反应太夸张了'。",
-        ],
-        "query": "之前沈辞恋爱的事，最后怎么样了？",
-        "expected": "被辟谣了，经纪公司声明是恶意造谣。用户松了口气，也觉得自己当时反应太夸张。",
-        "trap": "需要整合两条时间相近的记忆，给出完整结果而非只有爆料部分。",
-    },
-
-    # ═══ 用户B - 矛盾信息处理 ═══
-    {
-        "id": "B-011", "type": "矛盾信息处理", "user": "B",
-        "memories": [
-            "[2026-01-08] 偏好 用户说在追剧《星轨》，'沈辞主演，每周三更新，必追'。",
-            "[2026-02-15] 偏好 用户说弃追《星轨》了，'剧情越来越拖，沈辞戏份也少了，不想浪费时间'。",
-        ],
-        "query": "我还在看《星轨》吗？",
-        "expected": "不看了，2月已弃追。剧情拖、沈辞戏份少是原因。",
-        "trap": "系统可能基于早期'必追'记录，认为用户还在追。",
-    },
-    {
-        "id": "B-012", "type": "矛盾信息处理", "user": "B",
-        "memories": [
-            "[2026-01-15] 习惯 用户每天早上在学校操场跑步30分钟。",
-            "[2026-02-05] 情绪 用户说放寒假回家了，健身中断了，'家里没有跑步的习惯，懒了'。",
-            "[2026-03-01] 习惯 用户返校后重新开始健身，改去健身房，'操场太冷了，办了健身房年卡'。",
-            "[2026-03-15] 习惯 用户健身频率升级，变成早晚各一次。",
-        ],
-        "query": "我现在还在操场跑步吗？",
-        "expected": "不在操场跑了，现在去健身房，而且频率升级到早晚各一次。经历了操场跑步→寒假中断→返校改健身房→频率升级。",
-        "trap": "最初的操场跑步习惯被后来多次更新覆盖，系统需要整合完整变化路径。",
-    },
-    {
-        "id": "B-013", "type": "矛盾信息处理", "user": "B",
-        "memories": [
-            "[2026-01-05] 情绪 用户对沈辞无条件支持，'他做什么我都喜欢'。",
-            "[2026-03-20] 情绪 用户觉得沈辞接太多广告有点失望。",
-            "[2026-03-28] 情绪 用户说转向理性追星，还是会关注但没那么狂热。",
-        ],
-        "query": "我是沈辞的忠实粉丝吗？",
-        "expected": "曾经是无条件的忠实粉丝，现在转向理性追星了，因为对他商业化有些失望，但还是会持续关注。",
-        "trap": "系统可能只看最早的记忆给出'忠实粉丝'答案，忽略情感演变。",
-    },
-    {
-        "id": "B-014", "type": "矛盾信息处理", "user": "B",
-        "memories": [
-            "[2026-01-12] 事实 用户说论文题目还没定，'导师给了三个方向，还在纠结'。",
-            "[2026-02-20] 事实 用户说论文题目定了，选了'社交媒体对大学生消费行为的影响'。",
-            "[2026-03-25] 事实 用户论文初稿已交，导师反馈框架可以但文献综述薄。",
-        ],
-        "query": "我论文题目定了吗？",
-        "expected": "早定了（2月就定了），题目是'社交媒体对大学生消费行为的影响'，而且初稿都交了。",
-        "trap": "系统可能停在'还在纠结'的状态，忽略后续已确定的记录。",
-    },
-    {
-        "id": "B-015", "type": "矛盾信息处理", "user": "B",
-        "memories": [
-            "[2026-01-25] 情绪 用户因沈辞恋爱爆料'心碎了，好难受'。",
-            "[2026-02-03] 事实 用户说爆料被辟谣，松了口气，觉得自己反应太夸张。",
-        ],
-        "query": "沈辞谈恋爱了吗？",
-        "expected": "没有，之前的爆料已被辟谣，经纪公司声明是恶意造谣。",
-        "trap": "系统可能直接回答'有爆料说谈了'，忽略辟谣信息，给出错误结论。",
-    },
-
-    # ═══ 用户B - 信息衰减 ═══
-    {
-        "id": "B-016", "type": "信息衰减", "user": "B",
-        "memories": [
-            "[2026-01-20] 事实 用户说期末考试下周开始，有三门，最担心高数。",
-            "[2026-01-30] 事实 用户说考试结束了，高数估计能过，英语超常发挥。",
-        ],
-        "query": "我期末考试快到了吧，你帮我规划一下复习计划？",
-        "expected": "上学期期末考试1月底已经结束了，不需要复习计划。应询问用户是否有新的考试需要准备。",
-        "trap": "系统可能把已过去的考试当作即将到来的任务，给出过时的复习计划。",
-    },
-    {
-        "id": "B-017", "type": "信息衰减", "user": "B",
-        "memories": [
-            "[2026-01-08] 偏好 用户在追剧《星轨》，每周三更新必追。",
-            "[2026-02-15] 偏好 用户弃追《星轨》了。",
-        ],
-        "query": "《星轨》今天更新了，要不要提醒我去看？",
-        "expected": "用户2月已弃追《星轨》，不需要追剧提醒，应先确认用户是否重新开始看。",
-        "trap": "系统可能基于最初'必追'的记录答应设置提醒，忽略弃追记录。",
-    },
-    {
-        "id": "B-018", "type": "信息衰减", "user": "B",
-        "memories": [
-            "[2026-02-05] 情绪 用户说放寒假回家，健身中断了。",
-            "[2026-03-01] 习惯 用户返校重新开始健身，去健身房。",
-        ],
-        "query": "我寒假健身有坚持吗？",
-        "expected": "没有，寒假回家后健身中断了。现在已经返校重新开始了，但寒假期间确实没练。",
-        "trap": "系统可能只看到后来恢复健身的记录，忽略寒假中断的事实，给出错误回答。",
-    },
-    {
-        "id": "B-019", "type": "信息衰减", "user": "B",
-        "memories": [
-            "[2026-01-12] 事实 用户论文题目还没定，导师给了三个方向在纠结。",
-            "[2026-02-20] 事实 用户论文题目定了，选了'社交媒体对大学生消费行为的影响'。",
-        ],
-        "query": "我论文题目有没有定下来，帮我想想写哪个方向好？",
-        "expected": "题目早在2月就定了，是'社交媒体对大学生消费行为的影响'，不需要再纠结方向，而且初稿都交了。",
-        "trap": "系统可能停在纠结阶段，重新给用户推荐方向，忽略已定题目。",
-    },
-    {
-        "id": "B-020", "type": "信息衰减", "user": "B",
-        "memories": [
-            "[2026-01-25] 情绪 用户因沈辞恋爱爆料心碎了，好难受。",
-            "[2026-02-03] 事实 用户说爆料被辟谣了，松了口气。",
-        ],
-        "query": "我之前为沈辞的事很难受，现在好一点了吗？",
-        "expected": "好多了，那次爆料其实是被辟谣了，是恶意造谣，用户松了口气，还觉得自己当时反应太夸张了。",
-        "trap": "系统可能只看到'心碎难受'的情绪记录，给出安慰性回复，忽略辟谣导致问题已解决的事实。",
-    },
-]
+PASSIVE_RECALL_K = 8
+SIMILARITY_THRESHOLD = 0.5
 
 
-def call_llm(model: str, messages: list, max_tokens: int = 500) -> str:
+def get_eval_config() -> Config:
+    """复用生产 .env，只替换 working_dir 为评测专用路径。"""
+    cfg = Config.from_env()
+    cfg.working_dir = str(EVAL_DATA_DIR)
+    return cfg
+
+
+# ── LLM 同步调用（评判模型用，避免嵌套 asyncio）────────────────────────
+import requests
+
+def call_llm_sync(model: str, messages: list, api_key: str, base_url: str,
+                  max_tokens: int = 800) -> str:
+    if DRY_RUN:
+        return json.dumps({
+            "required_results": [],
+            "forbidden_triggered": False,
+            "forbidden_reason": "",
+            "bonus_count": 0,
+            "bonus_reasons": [],
+            "overall_pass": True,
+            "score": 1.0,
+            "summary": "[DRY-RUN]",
+        }, ensure_ascii=False)
+
     sess = requests.Session()
     sess.headers.update({
-        "Authorization": f"Bearer {API_TOKEN}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     })
-    r = sess.post(BASE_URL, json={
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-    }, timeout=60)
+    r = sess.post(
+        base_url.rstrip("/") + "/chat/completions",
+        json={"model": model, "messages": messages, "max_tokens": max_tokens},
+        timeout=90,
+    )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
 
 
-def build_butler_prompt(memories: list, query: str) -> list:
-    """构建 AI 管家的 prompt，注入历史记忆和当前时间"""
-    memory_text = "\n".join(memories)
-    system = f"""你是一个了解用户的AI管家。以下是你关于该用户的历史记忆记录：
-
-{memory_text}
-
-当前日期：{CURRENT_DATE}
-请基于以上记忆，自然地回答用户的问题。注意：
-- 以最新的信息为准
-- 如果信息已过时，应明确说明
-- 如果前后有矛盾，以最新记录为准并说明变化"""
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": query},
-    ]
+# ── 数据加载 ───────────────────────────────────────────────────────────────
+def load_test_files() -> list:
+    pattern = str(DAILY_DIR / "test_TC-C*.json")
+    files = sorted(glob.glob(pattern))
+    result = []
+    for f in files:
+        with open(f, encoding="utf-8") as fp:
+            result.append(json.load(fp))
+    return result
 
 
-def build_judge_prompt(memories: list, query: str, butler_answer: str, expected: str) -> list:
-    """构建评判模型的 prompt"""
-    memory_text = "\n".join(memories)
-    system = """你是一个严格的AI评测专家，负责评判AI管家的回答质量。
-请从以下三个维度打分，每个维度0-2分：
+def load_ground_truth() -> dict:
+    with open(GT_FILE, encoding="utf-8") as fp:
+        data = yaml.safe_load(fp)
+    return {tc["id"]: tc for tc in data["test_cases"]}
 
-1. **召回准确**（0-2）：使用的记忆是否正确？有无幻觉或捏造信息？
-   - 2分：完全基于记忆，无幻觉
-   - 1分：基本正确但有小偏差
-   - 0分：有明显错误或幻觉
 
-2. **时效判断**（0-2）：对过期/矛盾信息的处理是否正确？
-   - 2分：正确识别最新状态，处理矛盾/衰减信息准确
-   - 1分：部分正确，有小遗漏
-   - 0分：使用了过时信息，或忽略了重要的矛盾
+def get_trigger_message(test_data: dict) -> str:
+    for t in test_data.get("turns", []):
+        if t["role"] == "user":
+            return t["content"]
+    return ""
 
-3. **回答质量**（0-2）：基于正确记忆，回答是否自然得体、完整有用？
-   - 2分：自然、完整、有帮助
-   - 1分：基本可以，但略显机械或不完整
-   - 0分：答非所问或过于简陋
 
-请严格按以下JSON格式输出，不要有其他内容：
-{
-  "recall_score": <0-2>,
-  "temporal_score": <0-2>,
-  "quality_score": <0-2>,
-  "total": <0-6>,
-  "pass": <true/false>,
-  "reason": "<简短说明扣分原因，通过则写'通过'>"
-}"""
+# ── 自动关键词检查 ─────────────────────────────────────────────────────────
+def check_keyword(text: str, keywords: list, mode: str = "any") -> bool:
+    text_lower = text.lower()
+    hits = [kw.lower() in text_lower for kw in keywords]
+    return any(hits) if mode == "any" else not any(hits)
 
-    user = f"""【历史记忆】
-{memory_text}
 
-【用户问题】
-{query}
+def auto_check(item: dict, answer: str):
+    """返回 (result: bool|None, note: str)"""
+    check = item.get("check", "")
+    if check.startswith("response_mentions_any"):
+        m = re.search(r'\[([^\]]+)\]', check)
+        if m:
+            kws = [k.strip().strip('"\'') for k in m.group(1).split(",")]
+            r = check_keyword(answer, kws, "any")
+            return r, f"关键词{kws}: {'命中' if r else '未命中'}"
+    elif check.startswith("response_not_mentions_any"):
+        m = re.search(r'\[([^\]]+)\]', check)
+        if m:
+            kws = [k.strip().strip('"\'') for k in m.group(1).split(",")]
+            r = check_keyword(answer, kws, "none")
+            return r, f"禁止词{kws}: {'通过' if r else '出现禁止词'}"
+    return None, "需要评判模型"
 
-【AI管家回答】
+
+# ── 评判 prompt ────────────────────────────────────────────────────────────
+def build_judge_prompt(tc: dict, butler_answer: str, trigger_msg: str,
+                       passive_snippets: list, tool_calls_made: list) -> list:
+    required_text = "\n".join(
+        f"  [{r['id']}] {r['desc']}"
+        + (f"\n       标准: {r.get('rubric','').strip()}" if r.get("rubric") else "")
+        for r in tc.get("required", [])
+    )
+    forbidden_text = "\n".join(f"  - {f['desc']}" for f in tc.get("forbidden", []))
+    bonus_text = "\n".join(f"  - {b['desc']}" for b in tc.get("bonus", []))
+    snippets_text = "\n---\n".join(passive_snippets) if passive_snippets else "（无静默检索结果）"
+    tools_text = "、".join(tool_calls_made) if tool_calls_made else "（无工具调用）"
+
+    system = f"""你是严格的 AI 记忆能力评测专家。
+
+【用例】{tc['id']} — {tc['name']}
+【描述】{tc.get('description','').strip()}
+
+【必须满足（required）】
+{required_text}
+
+【绝对禁止（forbidden）】
+{forbidden_text if forbidden_text else '无'}
+
+【加分项（bonus）】
+{bonus_text if bonus_text else '无'}
+
+【ReMe 静默检索到的记忆片段】
+{snippets_text}
+
+【模型主动调用的工具】
+{tools_text}
+
+【触发问题】
+{trigger_msg}
+
+【AI 管家最终回答】
 {butler_answer}
 
-【期望输出参考】
-{expected}
+按以下 JSON 格式输出，不要有其他内容：
+{{
+  "required_results": [{{"id": "<id>", "pass": <true/false>, "reason": "<说明>"}}],
+  "forbidden_triggered": <true/false>,
+  "forbidden_reason": "<触发了哪条>",
+  "bonus_count": <0-3>,
+  "bonus_reasons": ["<说明>"],
+  "overall_pass": <true/false>,
+  "score": <0.0-1.0>,
+  "summary": "<一句话总结>"
+}}
 
-请评分："""
+规则：overall_pass = 所有 required 通过 AND forbidden_triggered=false；
+forbidden 触发时 score 必须为 0。"""
 
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
+    return [{"role": "system", "content": system}]
 
 
-def parse_judge_output(text: str) -> dict:
-    """解析评判模型输出的JSON"""
+def parse_judge(text: str) -> dict:
     try:
-        # 尝试直接解析
         return json.loads(text)
     except Exception:
-        # 尝试提取JSON块
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
+        m = re.search(r'\{[\s\S]*\}', text)
+        if m:
             try:
-                return json.loads(match.group())
+                return json.loads(m.group())
             except Exception:
                 pass
     return {
-        "recall_score": 0, "temporal_score": 0, "quality_score": 0,
-        "total": 0, "pass": False, "reason": f"解析失败: {text[:100]}"
+        "required_results": [], "forbidden_triggered": False,
+        "forbidden_reason": "", "bonus_count": 0, "bonus_reasons": [],
+        "overall_pass": False, "score": 0.0,
+        "summary": f"解析失败: {text[:100]}",
     }
 
 
-def run_eval():
-    token = API_TOKEN
-    if not token:
-        print("❌ 未设置 QIANFAN_TOKEN 环境变量")
+# ── 核心评测逻辑 ───────────────────────────────────────────────────────────
+async def run_eval():
+    # 检查重放是否已完成
+    if not EVAL_DATA_DIR.exists():
+        print(f"评测记忆目录不存在: {EVAL_DATA_DIR}")
+        print("请先运行: python eval/replay.py")
         return
 
+    cfg = get_eval_config()
+    system_prompt = (SRC_DIR / "prompts" / "system.txt").read_text(encoding="utf-8")
+
+    print("=" * 60)
+    print("AI管家记忆评测 v4 — 用户C（林晨）")
+    print(f"被测模型: {cfg.llm_model} | 评判模型: {JUDGE_MODEL}")
+    print(f"评测记忆: {EVAL_DATA_DIR}")
+    print(f"模式: {'DRY-RUN' if DRY_RUN else '正式评测'}")
+    print("=" * 60)
+
+    # 初始化评测专用 ReMe（与 main.py 完全一致的初始化参数）
+    print("\n初始化评测专用 ReMe...")
+    from reme.reme_light import ReMeLight
+    from openai import AsyncOpenAI
+    from tools import TOOLS, ToolExecutor
+
+    reme = ReMeLight(
+        working_dir=cfg.working_dir,
+        llm_api_key=cfg.llm_api_key,
+        llm_base_url=cfg.llm_base_url,
+        embedding_api_key=cfg.emb_api_key,
+        embedding_base_url=cfg.emb_base_url,
+        default_as_llm_config={"model_name": cfg.llm_model},
+        default_embedding_model_config={"model_name": cfg.emb_model},
+        default_file_store_config={"fts_enabled": True, "vector_enabled": True},
+        enable_load_env=False,
+    )
+    await reme.start()
+    print("ReMe 已启动")
+
+    # 初始化评测专用 ChatHistory（让模型可以调 search_history）
+    history = ChatHistory(data_dir=cfg.working_dir)
+
+    llm = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key)
+
+    # ToolExecutor：注入 history，让 search_history 工具可用
+    executor = ToolExecutor(reme, history=history)
+
+    test_files = load_test_files()
+    ground_truth = load_ground_truth()
+
     results = []
-    stats = {"total": 0, "pass": 0, "by_type": {}}
+    stats = {"total": 0, "pass": 0, "total_weight": 0.0, "weighted_score": 0.0}
 
-    print(f"开始评测，共 {len(EVAL_CASES)} 个 case\n{'='*60}")
+    for test_data in test_files:
+        meta = test_data.get("meta", {})
+        tc_id = meta.get("test_case_id", "UNKNOWN")
+        if tc_id not in ground_truth:
+            print(f"  {tc_id} 在 ground_truth 中找不到，跳过")
+            continue
 
-    for case in EVAL_CASES:
-        cid = case["id"]
-        ctype = case["type"]
-        print(f"[{cid}] {ctype} - {case['query'][:30]}...")
+        tc = ground_truth[tc_id]
+        weight = tc.get("scoring", {}).get("weight", 1.0)
+        trigger_msg = get_trigger_message(test_data)
 
-        # Step 1: 管家回答
-        butler_messages = build_butler_prompt(case["memories"], case["query"])
-        try:
-            butler_answer = call_llm(BUTLER_MODEL, butler_messages)
-        except Exception as e:
-            butler_answer = f"[ERROR: {e}]"
-            print(f"  ❌ 管家调用失败: {e}")
+        print(f"\n[{tc_id}] {tc['name']}")
+        print(f"  记忆间隔: {tc.get('memory_gap_days','?')} 天 | 权重: {weight}")
+        print(f"  触发问题: {trigger_msg[:80]}...")
 
-        # Step 2: 评判打分
+        # ── Step 1: 静默向量检索（与 main.py passive_recall 完全一致）──
+        passive_snippets = []
+        if not DRY_RUN:
+            passive_snippets = await passive_recall(
+                reme=reme,
+                query=trigger_msg,
+                threshold=cfg.memory_similarity_threshold,
+                k=PASSIVE_RECALL_K,
+            )
+        print(f"  ReMe 静默检索: {len(passive_snippets)} 条片段")
+
+        # ── Step 2: 读取评测专用 MEMORY.md ────────────────────────────
+        memory_md = ""
+        memory_file = EVAL_DATA_DIR / "MEMORY.md"
+        if memory_file.exists():
+            memory_md = memory_file.read_text(encoding="utf-8")
+
+        # ── Step 3: 组装 messages（与 main.py assembler.build 一致）──
+        # history 只有当前触发问题（评测每个 TC 都是独立的新对话）
+        final_messages = build(
+            system_prompt=system_prompt,
+            history=[{"role": "user", "content": trigger_msg}],
+            memory_md=memory_md,
+            retrieval_snippets=passive_snippets if passive_snippets else None,
+        )
+
+        # ── Step 4: Tool Call 循环（与 main.py run_tool_call_loop 完全一致）
+        butler_answer = "[DRY-RUN]"
+        tool_calls_made: list[str] = []
+
+        if not DRY_RUN:
+            # 用一个代理 history 记录工具调用，不写入真实历史
+            class _TrackHistory:
+                """只追踪工具调用名称，不真正写入 JSONL/DB。"""
+                def append(self, role: str, content: str):
+                    if role == "tool_call":
+                        tool_calls_made.extend(
+                            [t.strip() for t in content.split("、") if t.strip()]
+                        )
+
+            try:
+                reply, new_msgs = await run_tool_call_loop(
+                    llm=llm,
+                    model=cfg.llm_model,
+                    messages=final_messages,
+                    executor=executor,
+                    tools=TOOLS,
+                    history=_TrackHistory(),
+                )
+                butler_answer = reply or ""
+            except Exception as e:
+                butler_answer = f"[ERROR: {e}]"
+                print(f"  被测模型调用失败: {e}")
+                import traceback; traceback.print_exc()
+
+        if tool_calls_made:
+            print(f"  模型调用工具: {', '.join(tool_calls_made)}")
+        print(f"  管家回答: {butler_answer[:120]}...")
+
+        # ── Step 5: 自动关键词检查 ─────────────────────────────────────
+        auto_results = {}
+        forbidden_auto = False
+
+        for req in tc.get("required", []):
+            r, note = auto_check(req, butler_answer)
+            if r is not None:
+                auto_results[req["id"]] = (r, note)
+                icon = "✅" if r else "❌"
+                print(f"  {icon} [{req['id']}] 自动: {note}")
+
+        for forb in tc.get("forbidden", []):
+            r, note = auto_check(forb, butler_answer)
+            if r is not None and not r:
+                forbidden_auto = True
+                print(f"  Forbidden 触发: {forb['desc']}")
+
+        # ── Step 6: 评判模型打分 ────────────────────────────────────────
         judge_messages = build_judge_prompt(
-            case["memories"], case["query"], butler_answer, case["expected"]
+            tc, butler_answer, trigger_msg, passive_snippets, tool_calls_made
         )
         try:
-            judge_raw = call_llm(JUDGE_MODEL, judge_messages, max_tokens=300)
-            score = parse_judge_output(judge_raw)
+            judge_raw = call_llm_sync(
+                JUDGE_MODEL, judge_messages,
+                api_key=cfg.llm_api_key,
+                base_url=cfg.llm_base_url,
+                max_tokens=800,
+            )
+            judge_result = parse_judge(judge_raw)
         except Exception as e:
-            score = {
-                "recall_score": 0, "temporal_score": 0, "quality_score": 0,
-                "total": 0, "pass": False, "reason": f"评判调用失败: {e}"
+            print(f"  评判调用失败: {e}")
+            judge_result = {
+                "required_results": [], "forbidden_triggered": False,
+                "forbidden_reason": "", "bonus_count": 0, "bonus_reasons": [],
+                "overall_pass": False, "score": 0.0,
+                "summary": f"评判失败: {e}",
             }
-            print(f"  ❌ 评判调用失败: {e}")
 
-        result = {
-            "id": cid,
-            "type": ctype,
-            "user": case["user"],
-            "query": case["query"],
-            "butler_answer": butler_answer,
-            "expected": case["expected"],
-            "trap": case["trap"],
-            "score": score,
-        }
-        results.append(result)
+        # 自动检查结果覆盖评判（自动更可靠）
+        for req_id, (auto_pass, _) in auto_results.items():
+            for jr in judge_result.get("required_results", []):
+                if jr["id"] == req_id:
+                    jr["pass"] = auto_pass
+        if forbidden_auto:
+            judge_result["forbidden_triggered"] = True
+            judge_result["overall_pass"] = False
+            judge_result["score"] = 0.0
 
-        passed = score.get("pass", False)
-        total = score.get("total", 0)
-        reason = score.get("reason", "")
-        status = "✅" if passed else "❌"
-        print(f"  {status} 得分: {total}/6 | {reason}")
+        overall_pass = judge_result.get("overall_pass", False)
+        score = judge_result.get("score", 0.0)
+        bonus = judge_result.get("bonus_count", 0)
+        summary = judge_result.get("summary", "")
 
-        # 统计
         stats["total"] += 1
-        if passed:
+        stats["total_weight"] += weight
+        stats["weighted_score"] += weight * score
+        if overall_pass:
             stats["pass"] += 1
-        stats["by_type"].setdefault(ctype, {"total": 0, "pass": 0})
-        stats["by_type"][ctype]["total"] += 1
-        if passed:
-            stats["by_type"][ctype]["pass"] += 1
 
-    # 汇总
-    pass_rate = stats["pass"] / stats["total"] * 100 if stats["total"] > 0 else 0
-    print(f"\n{'='*60}")
-    print(f"总体通过率: {stats['pass']}/{stats['total']} ({pass_rate:.1f}%)")
-    print("\n分类通过率:")
-    for t, s in stats["by_type"].items():
-        r = s["pass"] / s["total"] * 100
-        print(f"  {t}: {s['pass']}/{s['total']} ({r:.1f}%)")
+        icon = "✅ PASS" if overall_pass else "❌ FAIL"
+        print(f"  {icon} | 得分: {score:.2f} | 加权: {weight * score:.2f} | {summary}")
+        for jr in judge_result.get("required_results", []):
+            ji = "✅" if jr.get("pass") else "❌"
+            print(f"    {ji} [{jr['id']}] {jr.get('reason','')}")
 
-    # 保存结果
+        results.append({
+            "id": tc_id,
+            "name": tc["name"],
+            "memory_gap_days": tc.get("memory_gap_days"),
+            "weight": weight,
+            "trigger_msg": trigger_msg,
+            "passive_snippets": passive_snippets,
+            "tool_calls_made": tool_calls_made,
+            "butler_answer": butler_answer,
+            "auto_checks": {k: {"pass": v[0], "note": v[1]} for k, v in auto_results.items()},
+            "forbidden_auto": forbidden_auto,
+            "judge_result": judge_result,
+            "overall_pass": overall_pass,
+            "score": score,
+            "weighted_score": weight * score,
+            "bonus": bonus,
+            "summary": summary,
+        })
+
+    # 清理
+    history.close()
+    try:
+        await reme.close()
+    except Exception:
+        pass
+
+    # ── 汇总 ──────────────────────────────────────────────────────────────
+    tw = stats["total_weight"]
+    ws = stats["weighted_score"]
+    final_pct = (ws / tw * 100) if tw > 0 else 0
+    pass_rate = (stats["pass"] / stats["total"] * 100) if stats["total"] > 0 else 0
+
+    print("\n" + "=" * 60)
+    print("评测结果汇总")
+    print("=" * 60)
+    print(f"通过率:   {stats['pass']}/{stats['total']} ({pass_rate:.1f}%)")
+    print(f"加权得分: {ws:.2f}/{tw:.2f} ({final_pct:.1f}%)")
+    for r in results:
+        i = "✅" if r["overall_pass"] else "❌"
+        print(f"  {i} {r['id']}: {r['score']:.2f} × {r['weight']} = {r['weighted_score']:.2f}")
+
     output = {
         "run_at": datetime.now().isoformat(),
-        "butler_model": BUTLER_MODEL,
+        "butler_model": cfg.llm_model,
         "judge_model": JUDGE_MODEL,
-        "stats": stats,
-        "pass_rate": round(pass_rate, 1),
+        "eval_data_dir": str(EVAL_DATA_DIR),
+        "dry_run": DRY_RUN,
+        "stats": {
+            "total": stats["total"],
+            "pass": stats["pass"],
+            "pass_rate": round(pass_rate, 1),
+            "total_weight": tw,
+            "weighted_score": round(ws, 3),
+            "final_score_pct": round(final_pct, 1),
+        },
         "results": results,
     }
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
@@ -629,4 +495,4 @@ def run_eval():
 
 
 if __name__ == "__main__":
-    run_eval()
+    asyncio.run(run_eval())

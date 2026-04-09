@@ -7,3 +7,11 @@ prompt_toolkit>=3.0.0
 # union-search-skill 基础依赖（no_api_key 分组所需）
 requests>=2.31.0
 lxml>=5.0.0
+
+# browser-use: AI 驱动的浏览器自动化
+browser-use>=0.12.0
+langchain-openai>=0.3.0
+
+# playwright 是 browser-use 的底层依赖
+# 安装后需运行: playwright install chromium
+playwright>=1.40.0
