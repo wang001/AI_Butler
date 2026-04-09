@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-AI管家记忆系统评测脚本 v4
+AI管家记忆系统评测脚本 v5
 - 评测模式：内联复用 main.py 完整流程（含 tool call loop、passive_recall）
 - 被测模型：从 .env 读取（llm_model）
-- 评判模型：kimi-k2.5
+- 评判模型：nvidia/nemotron-3-super-120b-a12b:free（OpenRouter，全量语义判断）
 
 前置步骤：
   python eval/replay.py       # 重放历史对话写入 ReMe（评测专用路径）
@@ -74,7 +74,12 @@ msgs_to_dicts = _main_module.msgs_to_dicts
 # ── 配置 ───────────────────────────────────────────────────────────────────
 DRY_RUN = "--dry-run" in sys.argv
 
-JUDGE_MODEL = "kimi-k2.5"
+# 评判模型：百度千帆 ernie-4.5-turbo（不限流）
+JUDGE_MODEL = "ernie-4.5-turbo-20260402"
+JUDGE_BASE_URL = "https://qianfan.baidubce.com/v2/coding"
+# 千帆 key 从 .env 的 LLM_API_KEY 读取
+JUDGE_API_KEY = os.environ.get("LLM_API_KEY", "")
+
 PASSIVE_RECALL_K = 8
 SIMILARITY_THRESHOLD = 0.5
 
@@ -89,8 +94,8 @@ def get_eval_config() -> Config:
 # ── LLM 同步调用（评判模型用，避免嵌套 asyncio）────────────────────────
 import requests
 
-def call_llm_sync(model: str, messages: list, api_key: str, base_url: str,
-                  max_tokens: int = 800) -> str:
+def call_judge_sync(messages: list, max_tokens: int = 1000) -> str:
+    """调用评判模型（OpenRouter），固定用 JUDGE_MODEL / JUDGE_API_KEY。"""
     if DRY_RUN:
         return json.dumps({
             "required_results": [],
@@ -105,13 +110,13 @@ def call_llm_sync(model: str, messages: list, api_key: str, base_url: str,
 
     sess = requests.Session()
     sess.headers.update({
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {JUDGE_API_KEY}",
         "Content-Type": "application/json",
     })
     r = sess.post(
-        base_url.rstrip("/") + "/chat/completions",
-        json={"model": model, "messages": messages, "max_tokens": max_tokens},
-        timeout=90,
+        JUDGE_BASE_URL.rstrip("/") + "/chat/completions",
+        json={"model": JUDGE_MODEL, "messages": messages, "max_tokens": max_tokens},
+        timeout=60,
     )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
@@ -141,68 +146,8 @@ def get_trigger_message(test_data: dict) -> str:
     return ""
 
 
-# ── 自动关键词检查 ─────────────────────────────────────────────────────────
-def check_keyword(text: str, keywords: list, mode: str = "any") -> bool:
-    text_lower = text.lower()
-    hits = [kw.lower() in text_lower for kw in keywords]
-    return any(hits) if mode == "any" else not any(hits)
-
-
-def auto_check(item: dict, answer: str):
-    """
-    返回 (result: bool|None, note: str)
-    result=None 表示需要评判模型，不能自动判定。
-    """
-    check = item.get("check", "")
-
-    if check.startswith("response_mentions_any"):
-        m = re.search(r'\[([^\]]+)\]', check)
-        if m:
-            kws = [k.strip().strip('"\'') for k in m.group(1).split(",")]
-            r = check_keyword(answer, kws, "any")
-            return r, f"关键词{kws}: {'命中' if r else '未命中'}"
-
-    elif check.startswith("response_not_mentions_any"):
-        m = re.search(r'\[([^\]]+)\]', check)
-        if m:
-            kws = [k.strip().strip('"\'') for k in m.group(1).split(",")]
-            # Bug fix 3: 禁止词出现不一定违规，需要判断语境
-            # 例如："下午别喝咖啡" 是在提醒禁忌，不是推荐；应通过，不应 fail
-            # 策略：找到关键词在 answer 中的上下文，判断是否是在推荐（而不是警告/提醒）
-            hit_kw = None
-            for kw in kws:
-                if kw.lower() in answer.lower():
-                    hit_kw = kw
-                    break
-
-            if hit_kw is None:
-                # 没有任何禁止词出现，通过
-                return True, f"禁止词{kws}: 通过（未出现）"
-
-            # 禁止词出现了，检查上下文是否是在"推荐/建议喝"的语境
-            # 找到关键词前后 30 字的上下文
-            idx = answer.lower().find(hit_kw.lower())
-            ctx = answer[max(0, idx - 30): idx + len(hit_kw) + 30]
-            # 推荐/建议喝的语境词
-            recommend_patterns = ["喝一杯", "来杯", "试试", "推荐", "可以喝", "适当喝", "来一杯", "提神"]
-            # 警告/禁止的语境词（扩展：覆盖"别再碰"、"别用"、"别碰"等表达）
-            warn_patterns = ["别喝", "不要喝", "避免", "不喝", "忌", "戒", "少喝", "禁忌",
-                             "影响睡眠", "不建议", "别再碰", "别碰", "不能喝", "不碰", "戒掉",
-                             "别用", "不用", "硬撑"]
-            is_recommending = any(p in ctx for p in recommend_patterns)
-            is_warning = any(p in ctx for p in warn_patterns)
-
-            if is_warning and not is_recommending:
-                # AI 在提醒不要喝，这是正确行为，通过
-                return True, f"禁止词'{hit_kw}'出现但属于警告语境（{ctx.strip()[:40]}），通过"
-            elif is_recommending:
-                # 明确在推荐，fail
-                return False, f"禁止词'{hit_kw}'出现且属于推荐语境（{ctx.strip()[:40]}），fail"
-            else:
-                # 语境不明确，交给评判模型
-                return None, f"禁止词'{hit_kw}'出现，语境不明确，需评判模型（{ctx.strip()[:40]}）"
-
-    return None, "需要评判模型"
+# ── auto_check 已移除 ──────────────────────────────────────────────────────
+# 所有 required/forbidden 判断全部交给评判模型（语义理解），不做关键词匹配。
 
 
 # ── 评判 prompt ────────────────────────────────────────────────────────────
@@ -218,7 +163,11 @@ def build_judge_prompt(tc: dict, butler_answer: str, trigger_msg: str,
     snippets_text = "\n---\n".join(passive_snippets) if passive_snippets else "（无静默检索结果）"
     tools_text = "、".join(tool_calls_made) if tool_calls_made else "（无工具调用）"
 
-    system = f"""你是严格的 AI 记忆能力评测专家。
+    system = f"""你是严格的 AI 记忆能力评测专家。你的任务是判断 AI 管家的回答是否满足评测标准。
+
+请做语义理解，不要做简单关键词匹配。例如：
+- "别用咖啡硬撑" 是在提醒不要喝咖啡，不算"建议喝咖啡"
+- "泰国免签，不用提前办" 是正确信息，不算"告诉用户需要办签证"
 
 【用例】{tc['id']} — {tc['name']}
 【描述】{tc.get('description','').strip()}
@@ -226,7 +175,7 @@ def build_judge_prompt(tc: dict, butler_answer: str, trigger_msg: str,
 【必须满足（required）】
 {required_text}
 
-【绝对禁止（forbidden）】
+【绝对禁止（forbidden，出现即 score=0）】
 {forbidden_text if forbidden_text else '无'}
 
 【加分项（bonus）】
@@ -244,11 +193,11 @@ def build_judge_prompt(tc: dict, butler_answer: str, trigger_msg: str,
 【AI 管家最终回答】
 {butler_answer}
 
-按以下 JSON 格式输出，不要有其他内容：
+你必须直接输出 JSON，不要有任何前置文字、分析过程、markdown 代码块标记。输出必须从第一个字符开始就是 {{，以 }} 结束。
 {{
   "required_results": [{{"id": "<id>", "pass": <true/false>, "reason": "<说明>"}}],
   "forbidden_triggered": <true/false>,
-  "forbidden_reason": "<触发了哪条>",
+  "forbidden_reason": "<触发了哪条，未触发填空字符串>",
   "bonus_count": <0-3>,
   "bonus_reasons": ["<说明>"],
   "overall_pass": <true/false>,
@@ -256,27 +205,65 @@ def build_judge_prompt(tc: dict, butler_answer: str, trigger_msg: str,
   "summary": "<一句话总结>"
 }}
 
-规则：overall_pass = 所有 required 通过 AND forbidden_triggered=false；
-forbidden 触发时 score 必须为 0。"""
+规则：
+- overall_pass = 所有 required 通过 AND forbidden_triggered=false
+- forbidden 触发时 score 必须为 0
+- score 根据 required 通过情况给分（全通过 0.8-1.0，部分通过 0.3-0.7，全不通过 0-0.2）"""
 
     return [{"role": "system", "content": system}]
 
 
 def parse_judge(text: str) -> dict:
+    # 1. 直接解析
     try:
         return json.loads(text)
     except Exception:
-        m = re.search(r'\{[\s\S]*\}', text)
-        if m:
+        pass
+
+    # 2. 找最后一个完整 JSON 对象（模型可能先输出分析再输出 JSON）
+    # 从后往前找 }，再找对应的 {
+    best = None
+    for end in range(len(text) - 1, -1, -1):
+        if text[end] != '}':
+            continue
+        for start in range(end, -1, -1):
+            if text[start] != '{':
+                continue
+            candidate = text[start:end + 1]
             try:
-                return json.loads(m.group())
+                obj = json.loads(candidate)
+                if "required_results" in obj:  # 确认是评判 JSON
+                    return obj
+                if best is None:
+                    best = obj  # 备用
             except Exception:
-                pass
+                continue
+        break  # 找到最右边的 } 后只需一轮
+
+    # 3. 宽松：找任意 {...} 块，取包含 required_results 的最大一个
+    for m in re.finditer(r'\{[\s\S]+?\}', text):
+        try:
+            obj = json.loads(m.group())
+            if "required_results" in obj:
+                return obj
+        except Exception:
+            continue
+
+    # 4. 兜底：尝试修复截断 JSON（补 }）
+    stripped = text.strip()
+    for suffix in ['"}', '"}]}}', '}}']:
+        try:
+            obj = json.loads(stripped + suffix)
+            if "required_results" in obj:
+                return obj
+        except Exception:
+            pass
+
     return {
         "required_results": [], "forbidden_triggered": False,
         "forbidden_reason": "", "bonus_count": 0, "bonus_reasons": [],
         "overall_pass": False, "score": 0.0,
-        "summary": f"解析失败: {text[:100]}",
+        "summary": f"解析失败: {text[:120]}",
     }
 
 
@@ -292,8 +279,9 @@ async def run_eval():
     system_prompt = (SRC_DIR / "prompts" / "system.txt").read_text(encoding="utf-8")
 
     print("=" * 60)
-    print("AI管家记忆评测 v4 — 用户C（林晨）")
-    print(f"被测模型: {cfg.llm_model} | 评判模型: {JUDGE_MODEL}")
+    print("AI管家记忆评测 v5 — 用户C（林晨）")
+    print(f"被测模型: {cfg.llm_model}")
+    print(f"评判模型: {JUDGE_MODEL} ({JUDGE_BASE_URL})")
     print(f"评测记忆: {EVAL_DATA_DIR}")
     print(f"模式: {'DRY-RUN' if DRY_RUN else '正式评测'}")
     print("=" * 60)
@@ -412,106 +400,26 @@ async def run_eval():
             print(f"  模型调用工具: {', '.join(tool_calls_made)}")
         print(f"  管家回答: {butler_answer[:120]}...")
 
-        # ── Step 5: 自动关键词检查 ─────────────────────────────────────
-        auto_results = {}
-        forbidden_auto = False
-
-        for req in tc.get("required", []):
-            r, note = auto_check(req, butler_answer)
-            if r is not None:
-                auto_results[req["id"]] = (r, note)
-                icon = "✅" if r else "❌"
-                print(f"  {icon} [{req['id']}] 自动: {note}")
-
-        for forb in tc.get("forbidden", []):
-            r, note = auto_check(forb, butler_answer)
-            # forbidden check 逻辑：
-            # - check=response_mentions_any：关键词出现(r=True) → 违规
-            # - check=response_not_mentions_any：关键词未出现(r=True) → 违规（不太常见）
-            # - r=None：需要评判模型，不自动判定
-            forb_check = forb.get("check", "")
-            if r is not None:
-                if forb_check.startswith("response_mentions_any") and r is True:
-                    forbidden_auto = True
-                    print(f"  Forbidden 触发: {forb['desc']} | {note}")
-                elif forb_check.startswith("response_not_mentions_any") and r is False:
-                    forbidden_auto = True
-                    print(f"  Forbidden 触发: {forb['desc']} | {note}")
-
-        # ── Step 6: 评判模型打分 ────────────────────────────────────────
+        # ── Step 5: 评判模型打分（全量语义判断，无关键词匹配）──────────
         judge_messages = build_judge_prompt(
             tc, butler_answer, trigger_msg, passive_snippets, tool_calls_made
         )
-        judge_failed = False
         try:
-            judge_raw = call_llm_sync(
-                JUDGE_MODEL, judge_messages,
-                api_key=cfg.llm_api_key,
-                base_url=cfg.llm_base_url,
-                max_tokens=800,
-            )
+            judge_raw = call_judge_sync(judge_messages, max_tokens=1000)
             judge_result = parse_judge(judge_raw)
+            print(f"  评判完成: {judge_result.get('summary','')[:60]}")
         except Exception as e:
             print(f"  评判调用失败: {e}")
-            judge_failed = True
-            # 评判失败时不直接计 0 分，先用空结构，后面靠 auto_check 填充
             judge_result = {
-                "required_results": [], "forbidden_triggered": False,
-                "forbidden_reason": "", "bonus_count": 0, "bonus_reasons": [],
-                "overall_pass": False, "score": 0.0,
-                "summary": f"评判超时，依赖自动检查结果",
+                "required_results": [],
+                "forbidden_triggered": False,
+                "forbidden_reason": "",
+                "bonus_count": 0,
+                "bonus_reasons": [],
+                "overall_pass": False,
+                "score": 0.0,
+                "summary": f"评判失败: {e}",
             }
-
-        # ── 自动检查结果合并到评判（自动更可靠，且评判失败时作为唯一依据）──
-        # Bug fix 1: 评判 API 超时时不应直接计 0，而是用 auto_check 结果算分
-        # Bug fix 2: forbidden auto_check 使用关键词匹配，可能误报——
-        #            只在 auto_check 明确触发 AND 回答语义确实是在告诫用户办签证时才生效。
-        #            对于"咖啡"这类禁止词：AI 如果是在提醒"不要喝咖啡"而非推荐，不应触发。
-        #            由于纯关键词无法判断语义，让 judge 做最终裁定，auto_check 只做初步标记。
-
-        for req_id, (auto_pass, _) in auto_results.items():
-            # 在 judge_result.required_results 里找对应条目并更新
-            found = False
-            for jr in judge_result.get("required_results", []):
-                if jr["id"] == req_id:
-                    jr["pass"] = auto_pass
-                    found = True
-            # 如果评判失败导致 required_results 为空，补全 auto_check 条目
-            if not found:
-                judge_result.setdefault("required_results", []).append({
-                    "id": req_id,
-                    "pass": auto_pass,
-                    "reason": f"auto_check: {auto_results[req_id][1]}",
-                })
-
-        # forbidden 最终裁定：auto_check 覆盖评判
-        # - forbidden check 基于关键词是否出现，auto_check 比评判更可靠
-        # - auto_check=False → 关键词未出现，forbidden 肯定不触发（覆盖评判误判）
-        # - auto_check=True → 关键词出现，保持 forbidden 触发
-        judge_result["forbidden_triggered"] = forbidden_auto
-        if forbidden_auto:
-            judge_result["overall_pass"] = False
-            judge_result["score"] = 0.0
-        elif judge_result.get("forbidden_triggered") and not forbidden_auto:
-            # 评判误判了 forbidden，修正：去掉 forbidden 限制后重算 overall_pass
-            all_reqs_pass = all(jr.get("pass", False) for jr in judge_result.get("required_results", []))
-            judge_result["overall_pass"] = all_reqs_pass
-            if all_reqs_pass:
-                # 恢复评判给的原始 score（已被 forbidden 清零，用 required 通过率估算）
-                req_list = judge_result.get("required_results", [])
-                judge_result["score"] = sum(1 for jr in req_list if jr.get("pass")) / len(req_list) if req_list else 0.8
-
-        # 评判失败时：根据 auto_check 结果重新计算 overall_pass 和 score
-        if judge_failed:
-            all_req = judge_result.get("required_results", [])
-            if all_req:
-                auto_pass_count = sum(1 for r in all_req if r.get("pass"))
-                auto_score = auto_pass_count / len(all_req)
-                auto_overall = all_req and all(r.get("pass") for r in all_req)
-                judge_result["score"] = auto_score
-                judge_result["overall_pass"] = auto_overall and not judge_result.get("forbidden_triggered", False)
-                judge_result["summary"] = f"评判超时，auto_check: {auto_pass_count}/{len(all_req)} 项通过，得分 {auto_score:.0%}"
-            # 没有任何 auto_check 结果时维持 0 分（无法判断）
 
         overall_pass = judge_result.get("overall_pass", False)
         score = judge_result.get("score", 0.0)
@@ -539,8 +447,6 @@ async def run_eval():
             "passive_snippets": passive_snippets,
             "tool_calls_made": tool_calls_made,
             "butler_answer": butler_answer,
-            "auto_checks": {k: {"pass": v[0], "note": v[1]} for k, v in auto_results.items()},
-            "forbidden_auto": forbidden_auto,
             "judge_result": judge_result,
             "overall_pass": overall_pass,
             "score": score,
