@@ -1,340 +1,182 @@
+# -*- coding: utf-8 -*-
 """
-ChatHistory — 原始对话日志持久化
+history.py — 对话历史日志系统
 
-架构：
-  - chat_history.jsonl  : append-only 原始记录，每行一个消息 turn
-  - chat_index.db       : SQLite FTS5 索引 + 元数据，存文件偏移量引用
+ChatHistory：双写 JSONL + SQLite FTS5
+  - JSONL：append-only，完整原始日志，按日切分（chat_YYYY-MM-DD.jsonl）
+  - SQLite FTS5：全文检索索引，支持 search(query, limit, role)
 
-JSONL 每行格式：
-  {
-    "id": "<uuid4>",          # 唯一消息 ID
-    "session_id": "<uuid4>",  # 本次启动的会话 ID
-    "ts": 1234567890.123,     # Unix timestamp（float）
-    "role": "user"|"assistant"|"tool",
-    "content": "...",         # 消息正文
-    "extra": {}               # 可选附加字段（tool_call_id、tool_name 等）
-  }
-
-SQLite 表：
-  messages(
-    id TEXT PRIMARY KEY,
-    session_id TEXT,
-    ts REAL,
-    role TEXT,
-    content_snippet TEXT,   -- content 前 500 字符，供快速预览
-    jsonl_offset INTEGER,   -- 该行在 JSONL 文件中的字节偏移，用于精确读取原文
-    jsonl_len INTEGER        -- 该行字节长度
-  )
-  messages_fts(content)     -- FTS5 虚表，content 列做全文索引
-                               使用 trigram tokenizer，天然支持中文
+用法：
+    history = ChatHistory(data_dir="/path/to/memory")
+    history.append("user", "今天天气真好")
+    history.append("assistant", "是啊，适合出门走走")
+    results = history.search("天气", limit=5)
+    history.close()
 """
 
 import json
+import os
 import sqlite3
-import uuid
 import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+
+
+CST = timezone(timedelta(hours=8))
 
 
 class ChatHistory:
-    """管理 JSONL 原始日志 + SQLite FTS5 索引的对话历史系统。"""
+    """JSONL + SQLite FTS5 双写对话历史系统。"""
 
-    JSONL_FILENAME = "chat_history.jsonl"
-    DB_FILENAME = "chat_index.db"
-
-    def __init__(self, data_dir: str | Path):
+    def __init__(self, data_dir: str):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        self.jsonl_path = self.data_dir / self.JSONL_FILENAME
-        self.db_path = self.data_dir / self.DB_FILENAME
+        # SQLite 数据库路径
+        db_path = self.data_dir / "chat_history.db"
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._init_db()
 
-        self._session_id = str(uuid.uuid4())
-        self._conn = self._init_db()
-
-    def _init_db(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")   # 并发友好
-        conn.execute("PRAGMA synchronous=NORMAL")  # 性能与安全的平衡
-
-        conn.executescript("""
+    def _init_db(self):
+        """初始化 SQLite FTS5 表。"""
+        cur = self._conn.cursor()
+        # 主表：存储消息元数据（不参与 FTS）
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
-                id              TEXT PRIMARY KEY,
-                session_id      TEXT NOT NULL,
-                ts              REAL NOT NULL,
-                role            TEXT NOT NULL,
-                content_snippet TEXT,
-                jsonl_offset    INTEGER NOT NULL,
-                jsonl_len       INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
-            CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role);
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-                id UNINDEXED,
-                content,
-                tokenize = 'trigram'
-            );
-        """)
-        conn.commit()
-        return conn
-
-    # ── 写入 ──────────────────────────────────────────────────────────────────
-
-    def append(
-        self,
-        role: str,
-        content: str,
-        extra: dict[str, Any] | None = None,
-    ) -> str:
-        """
-        追加一条消息到 JSONL 文件并同步更新 SQLite 索引。
-        返回消息的 UUID。
-        """
-        if not content:
-            return ""
-
-        msg_id = str(uuid.uuid4())
-        ts = time.time()
-        record = {
-            "id": msg_id,
-            "session_id": self._session_id,
-            "ts": ts,
-            "role": role,
-            "content": content,
-        }
-        if extra:
-            record["extra"] = extra
-
-        line = json.dumps(record, ensure_ascii=False) + "\n"
-        line_bytes = line.encode("utf-8")
-
-        # append 到 JSONL，记录偏移量
-        with open(self.jsonl_path, "ab") as f:
-            offset = f.seek(0, 2)   # 当前文件末尾 = 本行起始偏移
-            f.write(line_bytes)
-
-        snippet = content[:500]
-
-        self._conn.execute(
-            """
-            INSERT OR IGNORE INTO messages
-                (id, session_id, ts, role, content_snippet, jsonl_offset, jsonl_len)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (msg_id, self._session_id, ts, role, snippet, offset, len(line_bytes)),
-        )
-        # tool_call 是内务记录，不建 FTS5 索引，避免出现在用户搜索结果里
-        if role != "tool_call":
-            self._conn.execute(
-                "INSERT INTO messages_fts(id, content) VALUES (?, ?)",
-                (msg_id, content),
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts      REAL NOT NULL,
+                role    TEXT NOT NULL,
+                content TEXT NOT NULL
             )
+        """)
+        # FTS5 虚拟表：全文索引（内容来自 messages.content）
+        cur.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+            USING fts5(
+                content,
+                content='messages',
+                content_rowid='id',
+                tokenize='unicode61'
+            )
+        """)
+        # 触发器：insert 时自动同步到 FTS
+        cur.execute("""
+            CREATE TRIGGER IF NOT EXISTS messages_ai
+            AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content)
+                VALUES (new.id, new.content);
+            END
+        """)
         self._conn.commit()
-        return msg_id
 
-    def append_turn(self, user_content: str, assistant_content: str) -> None:
-        """一次性追加一轮对话（user + assistant）。"""
-        if user_content:
-            self.append("user", user_content)
-        if assistant_content:
-            self.append("assistant", assistant_content)
+    def _jsonl_path(self) -> Path:
+        """按日切分的 JSONL 文件路径。"""
+        date_str = datetime.now(CST).strftime("%Y-%m-%d")
+        return self.data_dir / f"chat_{date_str}.jsonl"
 
-    # ── 检索 ──────────────────────────────────────────────────────────────────
+    def append(self, role: str, content: str):
+        """追加一条消息到 JSONL 和 SQLite。"""
+        if not content:
+            return
+
+        ts = time.time()
+
+        # 写 JSONL
+        record = {"ts": ts, "role": role, "content": content}
+        with open(self._jsonl_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # 写 SQLite（只索引 user/assistant/tool，跳过 tool_call 记录）
+        if role in ("user", "assistant", "tool"):
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT INTO messages (ts, role, content) VALUES (?, ?, ?)",
+                (ts, role, content),
+            )
+            self._conn.commit()
 
     def search(
         self,
         query: str,
-        limit: int = 10,
+        limit: int = 8,
         role: str | None = None,
-        since_ts: float | None = None,
     ) -> list[dict]:
         """
-        多关键词相关性搜索，按命中关键词数量打分排序。
-
-        策略：
-          1. 按空格拆分查询为多个关键词
-          2. 每个关键词独立检索（>= 3 字符走 FTS5，< 3 字符走 LIKE）
-          3. 合并结果，按 (命中词数 / 总词数) 打分，同分按时间降序
-          4. 不要求所有关键词全部命中 — 命中 1 个也返回，只是排在后面
+        全文检索对话历史。
 
         Args:
-            query:    搜索关键词（支持中文，多个词用空格分隔）
-            limit:    最多返回条数
-            role:     过滤角色，None 表示不限
-            since_ts: 只返回该时间戳之后的记录（Unix float）
+            query: 搜索关键词，空格分隔多词（FTS5 OR 语义）
+            limit: 最多返回条数
+            role:  可选，只搜索指定角色（"user" 或 "assistant"）
 
         Returns:
-            list[dict]，每项包含：id, session_id, ts, role, content, snippet, score
-            score = 命中关键词数 / 总关键词数（0~1）
+            list of {"ts", "role", "content", "score"}，按相关度降序
         """
-        # 拆分关键词（去空、去重、保序）
-        keywords = list(dict.fromkeys(k for k in query.split() if k))
-        if not keywords:
+        if not query.strip():
             return []
 
-        # 公共过滤条件
-        extra_filters: list[str] = []
-        extra_params: list[Any] = []
-        if role:
-            extra_filters.append("m.role = ?")
-            extra_params.append(role)
-        if since_ts is not None:
-            extra_filters.append("m.ts >= ?")
-            extra_params.append(since_ts)
-        where_extra = (" AND " + " AND ".join(extra_filters)) if extra_filters else ""
+        limit = min(max(1, limit), 20)
 
-        # 每个关键词独立查询，收集 msg_id → 命中的关键词集合
-        # 多取一些候选（limit * 3），最后统一排序截断
-        candidate_limit = max(limit * 3, 30)
-        hit_map: dict[str, set[str]] = {}      # msg_id → {命中的关键词}
-        row_cache: dict[str, tuple] = {}        # msg_id → row tuple
-
-        for kw in keywords:
-            if len(kw) >= 3:
-                # FTS5 trigram 路径
-                fts_term = f'"{self._escape_fts_term(kw)}"'
-                sql = f"""
-                    SELECT m.id, m.session_id, m.ts, m.role,
-                           m.content_snippet, m.jsonl_offset, m.jsonl_len
-                    FROM messages_fts f
-                    JOIN messages m ON f.id = m.id
+        # FTS5 bm25() 返回负数（越小越相关），转成正数分数
+        try:
+            cur = self._conn.cursor()
+            if role:
+                cur.execute(
+                    """
+                    SELECT m.ts, m.role, m.content,
+                           -bm25(messages_fts) AS score
+                    FROM messages_fts
+                    JOIN messages m ON messages_fts.rowid = m.id
                     WHERE messages_fts MATCH ?
-                    {where_extra}
+                      AND m.role = ?
+                    ORDER BY score DESC
                     LIMIT ?
-                """
-                params: list[Any] = [fts_term] + extra_params + [candidate_limit]
+                    """,
+                    (self._fts_query(query), role, limit),
+                )
             else:
-                # 短词 LIKE 路径
-                escaped = kw.replace("%", r"\%").replace("_", r"\_")
-                sql = f"""
-                    SELECT m.id, m.session_id, m.ts, m.role,
-                           m.content_snippet, m.jsonl_offset, m.jsonl_len
-                    FROM messages m
-                    WHERE m.content_snippet LIKE ? ESCAPE '\\'
-                    {where_extra}
+                cur.execute(
+                    """
+                    SELECT m.ts, m.role, m.content,
+                           -bm25(messages_fts) AS score
+                    FROM messages_fts
+                    JOIN messages m ON messages_fts.rowid = m.id
+                    WHERE messages_fts MATCH ?
+                    ORDER BY score DESC
                     LIMIT ?
-                """
-                params = [f"%{escaped}%"] + extra_params + [candidate_limit]
-
-            for row in self._conn.execute(sql, params).fetchall():
-                msg_id = row[0]
-                hit_map.setdefault(msg_id, set()).add(kw)
-                if msg_id not in row_cache:
-                    row_cache[msg_id] = row
-
-        if not hit_map:
+                    """,
+                    (self._fts_query(query), limit),
+                )
+            rows = cur.fetchall()
+        except sqlite3.OperationalError:
+            # FTS 表可能还没有数据
             return []
-
-        # ── 两阶段打分 ──────────────────────────────────────────
-        # 阶段 1：按关键词命中率初筛 top 20
-        n_keywords = len(keywords)
-        pre_scored: list[tuple[float, float, str]] = []
-        for msg_id, hits in hit_map.items():
-            relevance = len(hits) / n_keywords
-            ts = row_cache[msg_id][2]
-            pre_scored.append((relevance, ts, msg_id))
-        pre_scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        top_candidates = pre_scored[:20]
-
-        # 阶段 2：综合打分 = relevance^α × (β + (1-β) × time_decay)
-        #   - relevance^α (α=1.5)：低相关性有更强惩罚（非线性）
-        #   - time_decay = 1/(1 + age_hours/half_life)：越近越高
-        #   - β=0.6：时间衰减下限，保证高相关性的旧记录不被过度压低
-        # 效果：rel=0.33 时间近→0.19, rel=1.0 时间远(30天)→0.64
-        now = time.time()
-        scored: list[tuple[float, float, float, str]] = []
-        for relevance, ts, msg_id in top_candidates:
-            final = self._compute_final_score(relevance, ts, now)
-            scored.append((final, relevance, ts, msg_id))
-        scored.sort(key=lambda x: x[0], reverse=True)
 
         results = []
-        for final, relevance, _ts, msg_id in scored[:limit]:
-            row = row_cache[msg_id]
-            msg_id, session_id, ts, role_, snippet, offset, length = row
-            content = self._read_jsonl_line(offset, length)
+        max_score = max((r[3] for r in rows), default=1.0) or 1.0
+        for ts, r, content, score in rows:
             results.append({
-                "id": msg_id,
-                "session_id": session_id,
                 "ts": ts,
-                "role": role_,
+                "role": r,
                 "content": content,
-                "snippet": snippet,
-                "score": round(final, 2),
-                "relevance": round(relevance, 2),
+                "score": score / max_score,  # 归一化到 0~1
             })
-
         return results
 
     @staticmethod
-    def _compute_final_score(
-        relevance: float,
-        ts: float,
-        now: float,
-        alpha: float = 1.5,
-        beta: float = 0.6,
-        half_life_hours: float = 72.0,
-    ) -> float:
+    def _fts_query(query: str) -> str:
         """
-        综合打分：关键词相关性 × 时间衰减。
-
-        公式：final = relevance^α × (β + (1-β) × time_decay)
-          - relevance: 命中关键词比例（0~1）
-          - α > 1: 对低相关性施加超线性惩罚
-          - time_decay = 1 / (1 + age_hours / half_life): 时间越近越接近 1
-          - β: 衰减下限，保证高相关性旧记录不被过度压低
-
-        设计意图：
-          - 相关性是主导因素，时间只做微调
-          - rel=0.3 + 时间近 → 分数仍低（~0.19）
-          - rel=1.0 + 时间远(30天) → 分数仍高（~0.64）
+        把用户输入的关键词转成 FTS5 查询语法。
+        多词之间用 OR 连接（任一词命中即可），不要求全部命中。
         """
-        age_hours = max(0.0, (now - ts) / 3600.0)
-        time_decay = 1.0 / (1.0 + age_hours / half_life_hours)
-        return (relevance ** alpha) * (beta + (1.0 - beta) * time_decay)
-
-    def _read_jsonl_line(self, offset: int, length: int) -> str:
-        """从 JSONL 文件的指定偏移量读取一行，返回 content 字段。"""
-        try:
-            with open(self.jsonl_path, "rb") as f:
-                f.seek(offset)
-                raw = f.read(length).decode("utf-8").strip()
-            record = json.loads(raw)
-            return record.get("content", "")
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _escape_fts_term(term: str) -> str:
-        """
-        将单个关键词转义为 FTS5 安全的短语片段（不含外层引号）。
-        调用方负责用双引号包裹和 AND 组合。
-        """
-        # 去掉 FTS5 特殊字符（" 和 *），防止语法错误
-        return term.replace('"', "").replace("*", "").strip()
-
-    # ── 统计 ──────────────────────────────────────────────────────────────────
-
-    def stats(self) -> dict:
-        """返回简单统计信息。"""
-        row = self._conn.execute(
-            "SELECT COUNT(*), MIN(ts), MAX(ts) FROM messages"
-        ).fetchone()
-        total, min_ts, max_ts = row
-        jsonl_size = self.jsonl_path.stat().st_size if self.jsonl_path.exists() else 0
-        return {
-            "total_messages": total,
-            "earliest_ts": min_ts,
-            "latest_ts": max_ts,
-            "jsonl_size_bytes": jsonl_size,
-            "session_id": self._session_id,
-        }
+        tokens = [t.strip() for t in query.split() if t.strip()]
+        if not tokens:
+            return '""'
+        # FTS5 中每个 token 用双引号包裹防止特殊字符问题，OR 连接
+        return " OR ".join(f'"{t}"' for t in tokens)
 
     def close(self):
+        """关闭数据库连接。"""
         try:
             self._conn.close()
         except Exception:

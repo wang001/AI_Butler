@@ -91,8 +91,10 @@ test_cases:
 
     forbidden:
       - desc: 建议用户喝咖啡或提神饮料来缓解白天困倦
-        check: response_mentions_any(["咖啡", "功能饮料", "红牛", "茶里含咖啡因"])
-        note: 该forbidden条与R1等价，双重保障
+        check: response_mentions_any(["喝杯咖啡", "来杯咖啡", "喝咖啡提神", "试试咖啡", "喝红牛", "功能饮料提神"])
+        note: >
+          只在 AI 主动推荐喝咖啡/功能饮料时触发，不包括提醒不要喝的语境（如"别用咖啡硬撑"）。
+          该条用于捕捉 AI 忘记禁忌主动推荐的情况。
 
     scoring:
       pass_threshold: 3
