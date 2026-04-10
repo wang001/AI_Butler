@@ -17,6 +17,36 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+# ── OpenAI function-calling schema ────────────────────────────────────────────
+
+BROWSER_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_use",
+            "description": (
+                "使用 AI 驱动的浏览器自动化执行网页操作任务。"
+                "只需用自然语言描述要做的事，浏览器 Agent 会自主完成：\n"
+                "  - 打开网页、点击按钮、填写表单\n"
+                "  - 提取页面内容、截图\n"
+                "  - 多步骤复杂操作（如搜索比价、填写申请等）\n"
+                "适合需要真实浏览器交互的场景，比 web_search 更强大但更慢。\n"
+                "典型用法：'打开 example.com 并提取主要内容'、'在淘宝搜索 XX 并比较价格'"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "自然语言描述的浏览器操作任务",
+                    },
+                },
+                "required": ["task"],
+            },
+        },
+    },
+]
+
 
 @dataclass
 class BrowserUseConfig:

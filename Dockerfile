@@ -48,4 +48,4 @@ ENV PYTHONPATH=/app/src
 
 # ── 入口 ──
 WORKDIR /app
-CMD ["python", "src/main.py"]
+CMD ["python", "src/cli/main.py"]
