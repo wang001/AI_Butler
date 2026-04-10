@@ -14,7 +14,7 @@ class Config:
     emb_api_key: str = ""
     emb_model: str = ""
 
-    working_dir: str = "/data/memory"
+    working_dir: str = "./data/memory"
     max_input_length: int = 128000
     compact_ratio: float = 0.7
     memory_compact_reserve: int = 10000

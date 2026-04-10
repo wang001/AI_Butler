@@ -1,132 +1,7 @@
-# AI Butler — 技术方案 v0.5
+# AI Butler — 一期技术方案 v0.3
 
 > 目标：构建一个能像人一样持续记忆、理解用户、自然对话的个人 AI 助手。
 > 核心挑战：跨会话记忆管理——分辨相关与不相关信息，能回忆近期和远期记忆，不"失忆"。
-
----
-
-## 零、MVP 实现现状（v0.5 更新）
-
-> 本节记录当前已实际落地的代码，与后续各节的"设计方案"做区分。
-
-### 已实现
-
-| 模块 | 实现方式 | 文件 |
-|------|---------|------|
-| CLI 对话主循环 | 纯 asyncio，无框架 | `src/main.py` |
-| ReMe 记忆底座 | `ReMeLight.pre_reasoning_hook`（短期压缩 + 异步沉淀） | `src/main.py` |
-| 长期记忆存储 | ReMe 内部管理（MEMORY.md + BM25 + 向量索引） | `data/.reme/` |
-| 被动记忆注入 | 每轮静默向量检索，相似度 ≥ 阈值才注入 system | `src/main.py` |
-| Context 组装 | 始终带 MEMORY.md；检索结果可选注入；历史按 token 预算截断 | `src/assembler.py` |
-| Tool Call 循环 | 最多 6 轮，多 tool call **并发执行**（asyncio.gather） | `src/main.py` |
-| 工具结果截断 | 超 800 tokens 自动截断并附说明，防止塞爆 context | `src/tools.py` |
-| LLM 限流重试 | 429 时指数退避重试，最多 3 次（2s→4s） | `src/main.py` |
-| 懒加载启动 | 重型库（transformers/chromadb）后台线程预热，CLI 立刻出现 | `src/main.py` |
-| 工具：主动记忆检索 | `search_memory` → ReMe `memory_search`（兼容 ToolResponse 新格式） | `src/tools.py` |
-| 工具：当前时间 | `get_current_time` → 返回北京时间 | `src/tools.py` |
-| 工具：网络搜索 | `web_search` → union-search-skill（30+ 平台，20s 整体超时保护） | `src/tools.py` |
-| 人格 Prompt | 中文管家人格，无谄媚 | `src/prompts/system.txt` |
-| Ctrl+C 处理 | 等待输入时取消并继续；LLM 处理中取消本轮继续；退出用 quit/Ctrl+D | `src/main.py` |
-
-### 与原设计方案的差异
-
-| 原设计方案 | 实际实现 | 原因 |
-|----------|---------|------|
-| LangGraph 状态机 | 纯 asyncio while 循环 | MVP 阶段无需状态机复杂度 |
-| 独立 Qdrant（Docker）+ BM25 | ReMe 内置向量 + BM25 | ReMe 已打包，无需额外部署 |
-| 三档查询路由（关键词规则） | 已删除，模型自主决策 | 关键词匹配太脆弱，Tool Call 更灵活 |
-| 梦境模块（矛盾检测+覆盖） | 未实现 | ReMe `summary_memory` 覆盖轻量版需求 |
-| user_profile.json | MEMORY.md（ReMe 管理） | ReMe 内置，格式不同 |
-| 复杂融合打分（α/β/γ/δ） | ReMe 内置检索，无需手写 | 复杂度换简单性 |
-
-### 当前对话流程
-
-```
-用户输入
-  │
-  ├─ 1. ReMe pre_reasoning_hook
-  │     短期记忆压缩（超过阈值时）+ 异步沉淀到长期记忆
-  │
-  ├─ 2. 静默记忆注入（passive recall）
-  │     向量搜索 top-8，score ≥ MEMORY_SIMILARITY_THRESHOLD 才注入 system
-  │
-  ├─ 3. 读取 MEMORY.md（用户画像，始终带入）
-  │
-  ├─ 4. Context 组装
-  │     system（人格 + 画像 + 可选检索片段）+ 历史（按 token 预算截断）
-  │
-  ├─ 5. Tool Call 循环（最多 6 轮）
-  │     模型按需主动调用：
-  │     - search_memory   → ReMe 主动检索长期记忆
-  │     - get_current_time → 北京时间
-  │     - web_search       → union-search-skill 多平台搜索
-  │
-  └─ 6. 打印最终回复，追加工作记忆
-```
-
-### 当前目录结构（实际）
-
-```
-AI_Butler/
-├── docs/
-│   ├── tech_spec.md
-│   └── coding_prompt.md
-├── src/
-│   ├── main.py          ← CLI 主循环 + Tool Call 循环 + 记忆注入
-│   ├── config.py        ← 环境变量读取（含相似度阈值）
-│   ├── assembler.py     ← Context 组装 + token 预算截断
-│   ├── tools.py         ← Tool 定义（schema）+ ToolExecutor（执行器）
-│   └── prompts/
-│       └── system.txt   ← 管家人格 Prompt
-├── vendor/
-│   └── union-search-skill/   ← git submodule，30+ 平台搜索
-├── data/
-│   └── .reme/               ← ReMe 运行时数据（MEMORY.md / BM25 / 向量索引）
-├── requirements.txt
-├── .env
-└── .env.example
-```
-
-### 环境变量（当前实际）
-
-```env
-# LLM（兼容 OpenAI 接口）
-LLM_BASE_URL=https://qianfan.baidubce.com/v2/coding
-LLM_API_KEY=your_key_here
-LLM_MODEL=glm-5
-
-# Embedding（OpenRouter 免费模型，2048维）
-EMB_BASE_URL=https://openrouter.ai/api/v1
-EMB_API_KEY=your_key_here
-EMB_MODEL=nvidia/llama-nemotron-embed-vl-1b-v2:free
-
-# 记忆检索：静默注入的相似度阈值（0~1，越高越严格）
-MEMORY_SIMILARITY_THRESHOLD=0.75
-
-# Web 搜索（可选，不配置则使用无 Key 引擎）
-# GITHUB_TOKEN=your_token
-# TAVILY_API_KEY=your_key
-# TIKHUB_TOKEN=your_token    # 解锁小红书/抖音/B站/Twitter
-```
-
-### 运行方式
-
-```bash
-# 首次克隆后拉取 submodule
-git submodule update --init
-
-# 创建虚拟环境
-python3 -m venv .venv && source .venv/bin/activate
-
-# 安装依赖
-pip install -r requirements.txt
-
-# 配置环境变量
-cp .env.example .env  # 填入 LLM_API_KEY 和 EMB_API_KEY
-
-# 运行（从项目根目录）
-python src/main.py
-```
 
 ---
 
@@ -457,9 +332,6 @@ LLM 回复预留                            ≤ 2000 tokens
 
 ## 十一、代码目录结构
 
-> ⚠️ 以下为原始设计方案目录，**实际 MVP 目录见第零节**。
-> 二期开始按此结构扩展。
-
 ```
 AI_Butler/
 ├── docs/
@@ -469,28 +341,33 @@ AI_Butler/
 │   ├── config.py                    ← 环境变量读取
 │   ├── prompts/
 │   │   └── system.txt               ← 程序记忆（人格定义）
-│   ├── hooks/                       ← ReMe pre_reasoning_hook 四步流程（待拆分）
+│   ├── hooks/                       ← ReMe pre_reasoning_hook 四步流程
 │   │   ├── compact_tool_result.py   ← Step1：工具输出压缩
 │   │   ├── check_context.py         ← Step2：Token 计数
 │   │   ├── compact_memory.py        ← Step3：短期记忆部分压缩
 │   │   └── summary_memory.py        ← Step4：异步沉淀到长期记忆
 │   ├── dream/
-│   │   └── dream_agent.py           ← 梦境模块：矛盾检测+覆盖+精炼（二期）
+│   │   └── dream_agent.py           ← 梦境模块：矛盾检测+覆盖+精炼
 │   ├── memory/
 │   │   ├── working.py               ← 工作记忆：结构管理 + 落盘
 │   │   ├── episodic.py              ← 情景记忆：Qdrant + 文件读写
 │   │   ├── semantic.py              ← 语义记忆：user_profile.json
 │   │   ├── retriever.py             ← 混合检索 + 融合打分
 │   │   └── writer.py                ← 记忆写入决策（重要性判断+分流）
+│   ├── router/
+│   │   └── query_router.py          ← 三档路由规则
 │   ├── context/
-│   │   └── assembler.py             ← Context 组装 + token 预算管理（已实现简化版）
+│   │   └── assembler.py             ← Context 组装 + token 预算管理
 │   └── llm/
 │       ├── client.py                ← LLM 调用封装（流式+非流式）
 │       └── embedding.py             ← Embedding 调用封装
-├── vendor/
-│   └── union-search-skill/          ← git submodule，30+ 平台搜索（已接入）
 ├── data/                            ← 运行时数据（不进 git）
-│   └── .reme/                       ← ReMe 数据目录（MEMORY.md + 索引）
+│   ├── user_profile.json
+│   ├── sessions/                    ← 短期记忆落盘
+│   ├── memory_store/                ← 长期记忆原文（按月 jsonl）
+│   ├── memory_files/                ← 工具输出压缩存储
+│   └── qdrant_storage/              ← Qdrant 数据目录
+├── docker-compose.yml
 ├── requirements.txt
 ├── .env
 └── .env.example
@@ -524,21 +401,14 @@ AI_Butler/
 
 ## 十三、一期里程碑
 
-- [x] **M1**：ReMe 底座集成，`pre_reasoning_hook` 接入（短期压缩 + 异步沉淀）
-- [x] **M2**：LLM + Embedding 客户端（OpenAI 兼容接口），Config 封装
-- [x] **M3**：长期记忆存储（ReMe 内置 MEMORY.md + BM25 + 向量索引，替代独立 Qdrant）
-- [x] **M4**：混合检索接入（ReMe `memory_search` + 静默相似度过滤）
-- [x] **M5**：短期记忆压缩（ReMe hook 触发）+ Context 组装 + Token 预算截断
-- [x] **M6**：Tool Call 框架（search_memory / get_current_time / web_search）
-- [x] **M7**：web_search 接入 union-search-skill（30+ 平台，无需 API Key）
-- [x] **M8**：端到端 CLI 对话跑通
-- [x] **M8.1**：兼容 ReMe v0.3+ API 变更（Msg 对象转换、ToolResponse 格式适配）
-- [x] **M8.2**：健壮性增强（LLM 限流重试、web_search 超时保护、Ctrl+C 正确处理）
-- [x] **M8.3**：启动性能优化（重型库懒加载 + 后台线程预热，CLI 立刻出现）
-- [x] **M8.4**：Tool Call 并发执行（asyncio.gather）+ 工具结果截断（800 tokens 上限）
-- [ ] **M9**：梦境模块（矛盾检测 + 记忆覆盖 + MEMORY.md 精炼）→ 二期
-- [ ] **M10**：更多工具（日历、提醒、文件操作等）→ 二期
-- [ ] **M11**：Telegram / 微信等 channel 接入 → 二期
+- [ ] **M1**：ReMe 底座集成，四步 hook 结构跑通
+- [ ] **M2**：LLM + Embedding 客户端封装，接口联调
+- [ ] **M3**：Qdrant 初始化 + 长期记忆两层存储跑通
+- [ ] **M4**：BM25 内存索引 + 混合检索 + 融合打分跑通
+- [ ] **M5**：短期记忆混合结构 + 压缩触发 + 全量落盘
+- [ ] **M6**：梦境模块轻量版（矛盾检测 + 覆盖 + user_profile 精炼）
+- [ ] **M7**：查询路由 + Context 组装 + Token 预算管理
+- [ ] **M8**：端到端 CLI 对话跑通
 
 ---
 
@@ -554,14 +424,7 @@ AI_Butler/
 | LangMem | Hot/Background 分离，Prompt 自优化（三期参考） |
 | Shodh-Memory | 算法衰减思路（数学公式，不用 LLM） |
 | Graphiti（getzep） | 二期时序图谱 |
-| Claude Code 源码架构分析 | Agent Loop 并发控制、工具结果截断、Prompt Cache 分段等工程实践参考 |
-
----
 
 ---
 
 *v0.3 — 2026-04-06，基于 4月3号完整设计讨论重写，纳入 ReMe 底座、梦境模块核心地位、前摄干扰处理、两层存储、BM25生命周期*
-
-*v0.4 — 2026-04-08，补充第零节"MVP 实现现状"：记录已落地的 MVP 代码（ReMe + Tool Call + union-search-skill），标注与原设计方案的差异，更新里程碑状态*
-
-*v0.5 — 2026-04-08，工程健壮性全面补齐：兼容 ReMe v0.3+ API（Msg 对象/ToolResponse 格式）、LLM 限流指数退避重试、web_search 20s 超时保护、Ctrl+C 正确处理（取消本轮而非退出）、重型库懒加载（CLI 启动从 9s 降至即时显示）、Tool Call 并发执行（asyncio.gather）、工具结果截断（800 tokens 上限）、模型切换为 kimi-k2.5；参考 Claude Code 源码架构完成对比分析，记录待补齐能力（Prompt Cache 分段、CLAUDE.md 注入等）*
