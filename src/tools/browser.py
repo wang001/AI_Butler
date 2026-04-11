@@ -76,33 +76,37 @@ class BrowserAgent:
         self._initialized = False
 
     async def _ensure_initialized(self):
-        """懒初始化：首次操作时才导入 browser-use 并启动浏览器"""
+        """懒初始化：首次操作时才导入 browser-use 并启动浏览器（兼容 >=0.12）"""
         if self._initialized:
             return
 
         try:
-            from browser_use import Browser, BrowserConfig
+            from browser_use.browser.profile import BrowserProfile
+            from browser_use.browser.session import BrowserSession
         except ImportError:
             raise RuntimeError(
-                "browser-use 未安装。请运行:\n"
-                "  pip install browser-use\n"
+                "browser-use 未安装或版本不兼容。请运行:\n"
+                "  pip install 'browser-use>=0.12.0'\n"
                 "  playwright install chromium"
             )
 
-        browser_config = BrowserConfig(
-            headless=self.config.headless,
-        )
-        self._browser = Browser(config=browser_config)
+        profile = BrowserProfile(headless=self.config.headless)
+        self._browser = BrowserSession(browser_profile=profile, is_local=True)
         self._initialized = True
 
     def _create_llm(self):
-        """创建供 browser-use Agent 使用的 LLM 实例（OpenAI 兼容）"""
-        from langchain_openai import ChatOpenAI
+        """创建供 browser-use Agent 使用的 LLM 实例。
 
-        return ChatOpenAI(
-            model=self.config.llm_model,
-            base_url=self.config.llm_base_url,
+        browser-use >=0.12 要求 LLM 实现其自己的 BaseChatModel 协议（含 provider 属性），
+        langchain_openai.ChatOpenAI 不满足，改用 browser_use.llm.litellm.ChatLiteLLM，
+        通过 'openai/<model>' 前缀 + api_base 连接任意 OpenAI 兼容端点。
+        """
+        from browser_use.llm.litellm.chat import ChatLiteLLM
+
+        return ChatLiteLLM(
+            model=f"openai/{self.config.llm_model}",
             api_key=self.config.llm_api_key,
+            api_base=self.config.llm_base_url,
         )
 
     async def run_task(self, task: str) -> dict:
@@ -126,7 +130,7 @@ class BrowserAgent:
         await self._ensure_initialized()
 
         try:
-            from browser_use import Agent
+            from browser_use.agent.service import Agent
         except ImportError:
             return {
                 "success": False,
@@ -141,8 +145,9 @@ class BrowserAgent:
             agent = Agent(
                 task=task,
                 llm=llm,
-                browser=self._browser,
+                browser_session=self._browser,
                 max_steps=self.config.max_steps,
+                use_vision=False,   # kimi-k2.5 等不支持 image_url，关闭截图视觉模式
             )
 
             result = await agent.run()
@@ -167,10 +172,10 @@ class BrowserAgent:
             }
 
     async def close(self):
-        """关闭浏览器并释放资源"""
+        """关闭浏览器并释放资源（兼容 BrowserSession.stop()）"""
         if self._browser:
             try:
-                await self._browser.close()
+                await self._browser.stop()
             except Exception:
                 pass
             self._browser = None
