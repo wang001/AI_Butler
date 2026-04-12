@@ -1,17 +1,27 @@
 """
 channels/cli.py — 命令行消息渠道
 
-将来自终端的用户输入/输出封装为 Channel，与飞书、企微等渠道保持统一的核心调用方式：
-    channel_specific_setup()
-    reply = await butler.chat(user_input)
-    channel_specific_output(reply)
+把当前终端作为一个 Channel 接入 AI Butler。
+与飞书、HTTP 等渠道统一的调用模型：
+
+    reply = await send_fn(user_input)   # 走 AIButlerApp.inbox 队列
 
 CLI 特有行为：
-    - 用 prompt_toolkit 读取用户输入（历史、Ctrl+C/D）
-    - 工具调用时显示 ThinkingSpinner 与进度行
-    - 支持 quit / exit / q / 退出 关键字退出当前 session
+  - 用 prompt_toolkit 读取用户输入（历史、Ctrl+C/D）
+  - 工具调用时显示 ThinkingSpinner 与进度行（通过 butler 回调）
+  - 支持 quit / exit / q / 退出 关键字退出当前 session
+
+参数说明：
+  butler  — Butler 实例，仅用于注册 on_tool_call / on_tool_result 回调，
+            不直接调用 butler.chat()。
+  send_fn — 异步可调用，签名 (str) -> str，由 AIButlerApp 提供，
+            内部走 inbox 队列，Agent 主循环串行处理后返回回复。
+            若未传入则退化为直接调用 butler.chat()（兼容单测场景）。
 """
+from __future__ import annotations
+
 import sys
+from typing import Callable, Awaitable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -20,16 +30,23 @@ from agent import Butler
 from cli.stream import safe_print, ThinkingSpinner
 
 
-async def run(butler: Butler) -> None:
+async def run(
+    butler: Butler,
+    send_fn: Callable[[str], Awaitable[str]] | None = None,
+) -> None:
     """
     启动命令行交互 session。
 
-    接收一个已初始化的 Butler 实例，负责终端侧的全部 I/O，
-    核心推理逻辑完全由 Butler.chat() 承接，与其他 Channel 保持一致。
+    Args:
+        butler : 已初始化的 Butler 实例（用于注册工具回调，不直接 chat）。
+        send_fn: 异步消息发送函数，来自 AIButlerApp.send()；
+                 默认 None 时退化为 butler.chat()（向后兼容）。
     """
+    _send = send_fn or butler.chat
+
     session = PromptSession()
 
-    # ── CLI 特有：工具调用进度回调 ──────────────────────────────────────────────
+    # ── CLI 特有：工具调用进度回调（在 Agent 主循环调用 butler.chat() 期间触发）──
     spinner: ThinkingSpinner | None = None
 
     def on_tool_call(name: str):
@@ -68,15 +85,14 @@ async def run(butler: Butler) -> None:
                 if not user_input:
                     continue
 
-                # CLI 特有：quit 指令退出 session
                 if user_input.lower() in ("quit", "exit", "q", "退出"):
                     break
 
-                # 核心推理：与其他 Channel 完全相同的调用方式
+                # 通过 send_fn 走 AIButlerApp.inbox 队列（或直接 butler.chat）
                 try:
                     with ThinkingSpinner() as sp:
                         spinner = sp
-                        reply = await butler.chat(user_input)
+                        reply = await _send(user_input)
                     spinner = None
                     safe_print(f"\nButler: {reply}")
                 except KeyboardInterrupt:
@@ -90,8 +106,5 @@ async def run(butler: Butler) -> None:
 
         finally:
             safe_print("\n正在保存记忆...")
-            try:
-                await butler.close()
-            except Exception as e:
-                safe_print(f"[保存记忆失败] {e}")
+            # butler.close() 由 AIButlerApp.run() 统一调用，此处无需重复
             safe_print("再见！")

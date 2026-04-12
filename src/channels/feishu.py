@@ -1,13 +1,14 @@
 """
 channels/feishu.py — 飞书 / Lark 事件订阅 webhook
 
-接收飞书推送的消息事件，调用 Butler.chat() 处理后回复。
+接收飞书推送的消息事件，通过 get_app().send() 进入 AIButlerApp.inbox 队列，
+Agent 主循环处理后将回复通过飞书 OpenAPI 发回用户。
 
 接入文档：https://open.feishu.cn/document/ukTMukTMukTM/uUTNz4SN1MjL1UzM
 """
 from fastapi import APIRouter, Request
 
-from gateway.server import get_butler
+from gateway.server import get_app
 
 router = APIRouter()
 
@@ -23,7 +24,7 @@ async def feishu_event(request: Request):
 
     # TODO: 验证签名（X-Lark-Signature）
     # TODO: 解析 payload，提取消息文本和 open_chat_id
-    # TODO: 调用 get_butler().chat(text) 获取回复
+    # TODO: 调用 get_app().send(text) 获取回复
     # TODO: 通过飞书 OpenAPI 发送回复消息
 
     return {"msg": "ok"}

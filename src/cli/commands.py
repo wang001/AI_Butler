@@ -1,20 +1,14 @@
 """
-cli/commands.py — 命令行入口
+cli/commands.py — CLI 模式启动适配器
 
-负责初始化 Butler 并将控制权交给 channels.cli 处理终端 I/O。
-终端交互的所有细节（输入读取、Spinner、quit 退出等）均在 channels/cli.py 中实现。
+兼容旧调用方式（cli/main.py → commands.run()），
+内部委托给 AIButlerApp 统一处理，确保消息走 inbox 队列。
 """
 from config import Config
-from agent import Butler, wait_heavy_loaded
-from cli.stream import safe_print
 
 
 async def run(cfg: Config) -> None:
-    """启动命令行交互会话。"""
-    from channels.cli import run as cli_channel_run
-
-    # 重型模块预热（chromadb / agentscope / reme）
-    wait_heavy_loaded(on_waiting=lambda: safe_print("（正在初始化记忆系统，请稍候…）"))
-
-    butler = await Butler.create(cfg, channel="cli")
-    await cli_channel_run(butler)
+    """启动 CLI 模式（委托给 AIButlerApp）。"""
+    from ai_butler import AIButlerApp
+    app = AIButlerApp(cfg)
+    await app.run(mode="cli")

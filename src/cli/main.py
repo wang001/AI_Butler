@@ -1,15 +1,11 @@
 """
-AI Butler — CLI 启动入口
+cli/main.py — CLI 启动入口（兼容保留）
 
-只做三件事：
-  1. 把 src/ 加入 sys.path（兼容直接运行和容器 /app）
-  2. 加载 .env
-  3. 把控制权交给 cli.commands.run()
+直接委托给 ai_butler.py 的统一入口，等价于：
+  python src/ai_butler.py --mode cli
 
-核心推理逻辑在 skills.agent.Butler，
-终端 I/O 在 cli.commands，流式渲染在 cli.stream。
+保留此文件是为了兼容现有的 docker CMD 和开发习惯。
 """
-import asyncio
 import sys
 import warnings
 from pathlib import Path
@@ -29,9 +25,10 @@ warnings.filterwarnings(
 from dotenv import load_dotenv
 load_dotenv()
 
-from config import Config
-from cli.commands import run
-
-
+# 委托给统一入口，强制 CLI 模式
 if __name__ == "__main__":
-    asyncio.run(run(Config.from_env()))
+    import sys
+    # 注入 --mode cli，避免被外部 argv 干扰
+    sys.argv = [sys.argv[0], "--mode", "cli"]
+    from ai_butler import main
+    main()

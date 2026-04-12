@@ -7,11 +7,20 @@
 #   /workspace    读写   工作区（Agent 命令执行、用户文件）
 #
 # 使用:
-#   docker-compose up --build      首次构建并启动
-#   docker-compose up              后续直接启动
-#   docker-compose down            停止
+#   CLI 模式（默认，交互终端）:
+#     docker-compose up --build
+#     docker attach ai-butler
+#
+#   Gateway 模式（常驻 HTTP 服务）:
+#     docker-compose --profile gateway up --build
+#
+#   两者同时运行（CLI + Gateway）:
+#     docker-compose --profile gateway up --build
+#     （cli 服务和 gateway 服务共享 /data 数据，对话历史会合并）
 
 services:
+
+  # ── CLI 模式：交互式命令行对话 ─────────────────────────────────────────────
   butler:
     build: .
     image: ai-butler:latest
@@ -21,24 +30,50 @@ services:
     stdin_open: true
     tty: true
 
-    # ── 卷挂载 ──
-    # /app 是镜像内置的只读应用层，不需要挂载
-    # 只挂载两个可写目录：
-    volumes:
-      - ./data:/data                # 持久化数据（记忆/日志/向量库）
-      - ./workspace:/workspace      # 工作区（Agent 命令执行读写）
+    # 默认入口即 CLI 模式（python src/ai_butler.py --mode cli）
+    command: ["python", "src/ai_butler.py", "--mode", "cli"]
 
-    # ── 环境变量（从 .env 文件加载） ──
+    volumes:
+      - ./data:/data
+      - ./workspace:/workspace
+
     env_file:
       - .env
 
-    # ── 资源限制 ──
     deploy:
       resources:
         limits:
           memory: 2g
           cpus: "2.0"
 
-    # ── 安全 ──
+    security_opt:
+      - no-new-privileges
+
+  # ── Gateway 模式：常驻 HTTP / WebSocket 服务 ───────────────────────────────
+  # 启用: docker-compose --profile gateway up
+  gateway:
+    build: .
+    image: ai-butler:latest
+    container_name: ai-butler-gateway
+    profiles: ["gateway"]
+
+    command: ["python", "src/ai_butler.py", "--mode", "gateway", "--port", "8080"]
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      - ./data:/data
+      - ./workspace:/workspace
+
+    env_file:
+      - .env
+
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+
     security_opt:
       - no-new-privileges

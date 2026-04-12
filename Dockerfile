@@ -46,6 +46,8 @@ RUN mkdir -p /data/memory /workspace
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/src
 
-# ── 入口 ──
+# ── 入口：统一由 ai_butler.py 分发模式 ──
+#   默认 CLI 模式（--mode cli）
+#   Gateway 模式：docker-compose command: python src/ai_butler.py --mode gateway
 WORKDIR /app
-CMD ["python", "src/cli/main.py"]
+CMD ["python", "src/ai_butler.py"]
