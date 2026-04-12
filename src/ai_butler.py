@@ -71,21 +71,46 @@ class AIButlerApp:
     def __init__(self, cfg: Config):
         self.cfg    = cfg
         self.butler = None          # 由 run() 初始化
-        self._inbox: asyncio.Queue[tuple[str, asyncio.Future[str]]] = asyncio.Queue()
+        self._inbox: asyncio.Queue[tuple[str, asyncio.Future[str], asyncio.Queue | None]] = asyncio.Queue()
         self._running = False
 
     # ── 对外接口（Channel 调用） ────────────────────────────────────────────────
 
     async def send(self, text: str) -> str:
         """
-        Channel 调用此方法向 Agent 发送消息，阻塞至收到回复后返回。
+        Channel 调用此方法向 Agent 发送消息，阻塞至收到完整回复后返回（非流式）。
 
         线程安全：多个 Channel 可同时调用，消息会按到达顺序串行处理。
         """
         loop    = asyncio.get_running_loop()
         future: asyncio.Future[str] = loop.create_future()
-        await self._inbox.put((text, future))
+        await self._inbox.put((text, future, None))
         return await future
+
+    async def send_stream(self, text: str):
+        """
+        Channel 调用此方法向 Agent 发送消息，以 AsyncGenerator 逐 token yield 回复（流式）。
+
+        实现方式：
+        - 向 inbox 放入消息时附带一个 asyncio.Queue 作为 token 通道。
+        - Agent 主循环检测到 token_queue 不为 None 时，调用 butler.chat_stream()
+          并将每个 token 放入 token_queue；结束时放入 sentinel（None）。
+        - 本方法从 token_queue 逐个取出 token 并 yield 给调用方。
+        """
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[str] = loop.create_future()
+        token_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        await self._inbox.put((text, future, token_queue))
+
+        # 逐 token yield（直到 sentinel None）
+        while True:
+            token = await token_queue.get()
+            if token is None:
+                break
+            yield token
+
+        # 等待 future 确保 agent loop 完成（异常也会在此抛出）
+        await future
 
     # ── Agent 主循环 ────────────────────────────────────────────────────────────
 
@@ -93,23 +118,40 @@ class AIButlerApp:
         """
         后台协程：串行消费 inbox，保证 Butler 内部对话历史的一致性。
 
-        每次从队列取出一条消息，调用 Butler.chat()，再把回复写入 Future。
-        所有 Channel 的请求最终都在这里被顺序处理。
+        inbox 中的每条消息格式为 (text, future, token_queue)：
+        - token_queue 为 None  → 非流式，调用 butler.chat()，结果写入 future。
+        - token_queue 不为 None → 流式，调用 butler.chat_stream()，
+          逐 token 放入 token_queue，结束放 sentinel(None)，future 写入完整回复。
         """
         while self._running:
             try:
-                # 带超时轮询，方便 _running=False 时及时退出
-                text, future = await asyncio.wait_for(
-                    self._inbox.get(), timeout=1.0
-                )
+                item = await asyncio.wait_for(self._inbox.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
+            text, future, token_queue = item
+
             try:
-                reply = await self.butler.chat(text)
-                if not future.done():
-                    future.set_result(reply)
+                if token_queue is None:
+                    # 非流式
+                    reply = await self.butler.chat(text)
+                    if not future.done():
+                        future.set_result(reply)
+                else:
+                    # 流式：逐事件推送到 token_queue
+                    # \x00 开头的是工具调用事件 marker，不计入最终回复文本
+                    reply_parts: list[str] = []
+                    async for token in self.butler.chat_stream(text):
+                        if not token.startswith("\x00"):
+                            reply_parts.append(token)
+                        await token_queue.put(token)
+                    await token_queue.put(None)  # sentinel
+                    reply = "".join(reply_parts)
+                    if not future.done():
+                        future.set_result(reply)
             except Exception as exc:
+                if token_queue is not None:
+                    await token_queue.put(None)  # 异常时也要结束 sentinel
                 if not future.done():
                     future.set_exception(exc)
             finally:
@@ -126,11 +168,12 @@ class AIButlerApp:
         - gateway 模式：uvicorn 收到 SIGTERM / SIGINT
         """
         from agent import Butler, wait_heavy_loaded
-        from cli.stream import safe_print
 
-        wait_heavy_loaded(
-            on_waiting=lambda: safe_print("（正在初始化记忆系统，请稍候…）")
-        )
+        if mode == "cli":
+            from cli.stream import safe_print
+            wait_heavy_loaded(on_waiting=lambda: safe_print("（正在初始化记忆系统，请稍候…）"))
+        else:
+            wait_heavy_loaded()
         self.butler   = await Butler.create(self.cfg, channel=mode)
         self._running = True
 
@@ -157,12 +200,14 @@ class AIButlerApp:
         启动 CLI Channel（当前终端）。
 
         CLI 既持有 butler 引用（注册 ThinkingSpinner 工具回调），
-        又通过 self.send() 走 inbox 队列发送消息。
-        两者协同工作：回调在 Agent 主循环调用 butler.chat() 期间触发，
-        CLI 侧通过 asyncio Future 等待回复，正好能看到 Spinner 进度。
+        又通过 self.send_stream() 走 inbox 队列流式发送消息，逐 token 打印。
         """
         from channels.cli import run as cli_run
-        await cli_run(self.butler, send_fn=self.send)
+        await cli_run(
+            self.butler,
+            send_fn=self.send,
+            send_stream_fn=self.send_stream,
+        )
 
     async def _start_gateway(self, host: str, port: int) -> None:
         """
@@ -186,6 +231,7 @@ class AIButlerApp:
         gw_server.set_app(self)
 
         print(f"[AI Butler Gateway] http://{host}:{port}")
+        print(f"  GET  /          网页对话界面")
         print(f"  GET  /health    健康检查")
         print(f"  POST /api/chat  REST 问答")
         print(f"  WS   /api/ws    WebSocket 流式对话")

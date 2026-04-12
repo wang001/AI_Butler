@@ -1,13 +1,17 @@
 """
 gateway/server.py — FastAPI 应用定义
 
-不再负责 Butler 的生命周期管理（由 AIButlerApp 统一持有）。
-路由处理器通过 get_app() 获取 AIButlerApp 实例，
-再调用 app.send(text) 向 Agent 主循环提交消息。
+仅负责：
+  1. 持有全局 AIButlerApp 实例（set_app / get_app），供各 Channel 路由调用
+  2. 创建 FastAPI app，挂载各 Channel 路由
+
+Butler 的生命周期由 AIButlerApp 统一管理，Channel 路由处理器通过 get_app()
+获取 AIButlerApp 实例，再调用 app.send() / app.send_stream() 与 Agent 交互。
 
 挂载路由：
-  /feishu  → channels/feishu.py  (飞书 webhook)
-  /api     → gateway/web.py      (通用 REST / WebSocket)
+  /        → landingpage/         (网页对话界面静态资源)
+  /feishu  → channels/feishu.py   (飞书 Webhook Channel)
+  /api     → channels/web.py      (Web Channel: REST / SSE / WebSocket)
   /health  → 健康检查
 """
 from __future__ import annotations
@@ -42,6 +46,9 @@ def get_app() -> "AIButlerApp":
 app = FastAPI(title="AI Butler Gateway")
 
 # ── 挂载渠道路由 ───────────────────────────────────────────────────────────────
+
+from landingpage import router as landingpage_router
+app.include_router(landingpage_router, tags=["网页界面"])
 
 from channels.feishu import router as feishu_router
 app.include_router(feishu_router, prefix="/feishu", tags=["飞书"])
