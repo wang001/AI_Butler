@@ -2,38 +2,60 @@
 channels/cli.py — 命令行消息渠道
 
 把当前终端作为一个 Channel 接入 AI Butler。
-与飞书、HTTP 等渠道统一的调用模型：
+通过 CliHook（AgentHook 子类）接收工具调用进度事件，驱动 ThinkingSpinner。
 
-    async for token in send_stream_fn(user_input):  # 流式，逐 token 打印
-        ...
-
-CLI 特有行为：
-  - 用 prompt_toolkit 读取用户输入（历史、Ctrl+C/D）
-  - 工具调用时显示 ThinkingSpinner 与进度行（通过 butler 回调）
-  - 流式模式：第一个 token 到来前显示 ThinkingSpinner，
-    收到第一个 token 后关闭 Spinner，开始逐 token 打印
-  - 支持 quit / exit / q / 退出 关键字退出当前 session
-
-参数说明：
-  butler        — Butler 实例，仅用于注册 on_tool_call / on_tool_result 回调，
-                  不直接调用 butler.chat()。
-  send_stream_fn — 异步生成器，签名 (str) -> AsyncGenerator[str, None]，
-                   由 AIButlerApp 提供（app.send_stream）。
+调用流程：
+    hook = CliHook()
+    butler = await Butler.create(cfg, channel="cli", hook=hook)
+    await cli_run(hook=hook, send_stream_fn=app.send_stream)
 """
 from __future__ import annotations
 
 import sys
+import threading
 from typing import Callable, AsyncGenerator, Awaitable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from agent import Butler
-from cli.stream import safe_print, ThinkingSpinner
+from agent.hooks import AgentHook
+from cli.stream import safe_print, ThinkingSpinner, _STDOUT_LOCK
+
+
+class CliHook(AgentHook):
+    """
+    CLI 专用 AgentHook。
+
+    在工具调用期间暂停 spinner 并打印进度行。
+    spinner 引用由 run() 主循环在每轮对话开始时注入。
+    """
+
+    def __init__(self):
+        self._spinner: ThinkingSpinner | None = None
+        self._spinner_lock = threading.Lock()
+
+    def set_spinner(self, spinner: ThinkingSpinner | None) -> None:
+        with self._spinner_lock:
+            self._spinner = spinner
+
+    async def on_tool_start(self, name: str, args: dict) -> None:
+        with self._spinner_lock:
+            spinner = self._spinner
+        if spinner:
+            with spinner.pause():
+                safe_print(f"\n[工具调用] {name}")
+
+    async def on_tool_end(self, name: str, result: str) -> None:
+        with self._spinner_lock:
+            spinner = self._spinner
+        if spinner:
+            with spinner.pause():
+                preview = result[:200] + ("..." if len(result) > 200 else "")
+                safe_print(f"[工具结果:{name}] {preview}")
 
 
 async def run(
-    butler: Butler,
+    hook: CliHook,
     send_fn: Callable[[str], Awaitable[str]] | None = None,
     send_stream_fn: Callable[[str], AsyncGenerator[str, None]] | None = None,
 ) -> None:
@@ -41,31 +63,12 @@ async def run(
     启动命令行交互 session（流式输出优先）。
 
     Args:
-        butler        : 已初始化的 Butler 实例（用于注册工具回调）。
-        send_fn       : 非流式发送函数（向后兼容，当 send_stream_fn 未提供时使用）。
+        hook          : CliHook 实例，与 Butler 创建时传入的同一个对象。
+        send_fn       : 非流式发送函数（当 send_stream_fn 未提供时使用）。
         send_stream_fn: 流式发送函数（优先使用），来自 AIButlerApp.send_stream。
     """
     session = PromptSession()
 
-    # ── CLI 特有：工具调用进度回调 ────────────────────────────────────────────
-    spinner: ThinkingSpinner | None = None
-
-    def on_tool_call(name: str):
-        nonlocal spinner
-        if spinner:
-            with spinner.pause():
-                safe_print(f"\n[工具调用] {name}")
-
-    def on_tool_result(name: str, result: str):
-        if spinner:
-            with spinner.pause():
-                preview = result[:200] + ("..." if len(result) > 200 else "")
-                safe_print(f"[工具结果:{name}] {preview}")
-
-    butler.on_tool_call   = on_tool_call
-    butler.on_tool_result = on_tool_result
-
-    # ── 主循环 ────────────────────────────────────────────────────────────────
     with patch_stdout():
         safe_print("=" * 40)
         safe_print("AI Butler 已启动，输入 quit 退出")
@@ -73,7 +76,7 @@ async def run(
 
         try:
             while True:
-                # 读取输入
+                # ── 读取输入 ──────────────────────────────────────────────────
                 try:
                     user_input = await session.prompt_async("\n你: ")
                     user_input = user_input.strip()
@@ -91,58 +94,91 @@ async def run(
 
                 # ── 流式输出 ──────────────────────────────────────────────────
                 if send_stream_fn is not None:
+                    sp = None
                     try:
+                        sp = ThinkingSpinner()
+                        sp.__enter__()
+                        hook.set_spinner(sp)
+                        
                         first_token = True
-                        with ThinkingSpinner() as sp:
-                            spinner = sp
-                            gen = send_stream_fn(user_input)
-                            async for token in gen:
-                                    # 跳过工具事件 marker（CLI 通过 on_tool_call 回调展示）
-                                    if token.startswith("\x00"):
-                                        continue
-                                    if first_token:
-                                        # 第一个 token 到来：关闭 spinner，开始打印
-                                        sp._stop.set()
-                                        sp._thread.join(timeout=1)
-                                        sys.stdout.write("\r\033[K")   # 清除 spinner 行
-                                        sys.stdout.write("\nButler: ")
-                                        sys.stdout.flush()
-                                        first_token = False
-                                        spinner = None
-                                    sys.stdout.write(token)
+                        gen = send_stream_fn(user_input)
+                        async for token in gen:
+                            # \x00 开头是工具事件 marker，由 CliHook 已处理，跳过
+                            if token.startswith("\x00"):
+                                continue
+                            if first_token:
+                                # 第一个 token 到来：关闭 spinner，开始打印
+                                # 关键：必须在 hook.set_spinner(None) 之前停止 spinner
+                                hook.set_spinner(None)
+                                sp.stop(clear=True)
+                                with _STDOUT_LOCK:
+                                    sys.stdout.write("\nButler: ")
                                     sys.stdout.flush()
+                                first_token = False
+                            with _STDOUT_LOCK:
+                                sys.stdout.write(token)
+                                sys.stdout.flush()
+                        
+                        # 流式结束：如果收到了 token，打印换行；否则打印 "Butler: " 前缀
                         if not first_token:
+                            with _STDOUT_LOCK:
+                                sys.stdout.write("\n")
+                                sys.stdout.flush()
+                        else:
+                            # 没有收到任何 token，仍需清除 spinner 并打印前缀
+                            hook.set_spinner(None)
+                            sp.stop(clear=True)
+                            with _STDOUT_LOCK:
+                                sys.stdout.write("\nButler: （无回复）\n")
+                                sys.stdout.flush()
+                        
+                        sp.__exit__(None, None, None)
+                    except KeyboardInterrupt:
+                        hook.set_spinner(None)
+                        if sp:
+                            sp.stop(clear=True)
+                            sp.__exit__(None, None, None)
+                        with _STDOUT_LOCK:
                             sys.stdout.write("\n")
                             sys.stdout.flush()
-                        spinner = None
-                    except KeyboardInterrupt:
-                        spinner = None
-                        sys.stdout.write("\n")
                         safe_print("（当前回复已中断，继续对话；输入 quit 退出）")
                     except Exception as e:
-                        spinner = None
+                        hook.set_spinner(None)
+                        if sp:
+                            sp.stop(clear=True)
+                            sp.__exit__(None, None, None)
                         safe_print(f"\n[错误: {e}]")
                         import traceback
                         traceback.print_exc()
 
-                # ── 非流式兜底（无 send_stream_fn 时） ────────────────────────
-                else:
-                    _send = send_fn or butler.chat
+                # ── 非流式兜底 ────────────────────────────────────────────────
+                elif send_fn is not None:
+                    sp = None
                     try:
-                        with ThinkingSpinner() as sp:
-                            spinner = sp
-                            reply = await _send(user_input)
-                        spinner = None
+                        sp = ThinkingSpinner()
+                        sp.__enter__()
+                        hook.set_spinner(sp)
+                        reply = await send_fn(user_input)
+                        hook.set_spinner(None)
+                        sp.stop(clear=True)
+                        sp.__exit__(None, None, None)
                         safe_print(f"\nButler: {reply}")
                     except KeyboardInterrupt:
-                        spinner = None
+                        hook.set_spinner(None)
+                        if sp:
+                            sp.stop(clear=True)
+                            sp.__exit__(None, None, None)
                         safe_print("\n（当前回复已中断，继续对话；输入 quit 退出）")
                     except Exception as e:
-                        spinner = None
+                        hook.set_spinner(None)
+                        if sp:
+                            sp.stop(clear=True)
+                            sp.__exit__(None, None, None)
                         safe_print(f"\n[错误: {e}]")
                         import traceback
                         traceback.print_exc()
 
         finally:
+            hook.set_spinner(None)
             safe_print("\n正在保存记忆...")
             safe_print("再见！")

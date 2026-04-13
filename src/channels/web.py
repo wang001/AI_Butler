@@ -35,7 +35,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-# 工具事件 marker 前缀（由 agent._tool_call_loop_streaming 发出）
+# 工具事件 marker 前缀（由 agent.runner.AgentRunner.run_stream 发出）
 _TOOL_CALL_PREFIX   = "\x00TOOL_CALL:"
 _TOOL_RESULT_PREFIX = "\x00TOOL_RESULT:"
 
@@ -55,7 +55,7 @@ def _parse_token(token: str) -> dict:
     工具调用 → {"type": "tool_call",   "name": "...", "args": {...}}
     工具结果 → {"type": "tool_result", "name": "..."}
 
-    marker 格式（agent._tool_call_loop_streaming）：
+    marker 格式（agent.runner.AgentRunner.run_stream）：
       TOOL_CALL   前缀后跟 {"name":"...", "args":{...}} JSON
       TOOL_RESULT 前缀后跟 {"name":"..."} JSON
     """
