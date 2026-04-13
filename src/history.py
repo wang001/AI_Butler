@@ -274,6 +274,53 @@ class ChatHistory:
             for ts, role_, content, sid, ch, score in rows
         ]
 
+    def get_since(
+        self,
+        since_ts: float,
+        limit: int = 500,
+        role: str | None = None,
+        channel: str | None = None,
+    ) -> list[dict]:
+        """
+        查询指定时间戳之后的对话记录（不走 FTS，直接查主表）。
+
+        Args:
+            since_ts : 起始时间戳（不包含该时刻）
+            limit    : 最多返回条数，默认 500，最大 2000
+            role     : 可选，只返回指定角色
+            channel  : 可选，只返回指定渠道
+        """
+        limit = min(max(1, limit), 2000)
+        conditions = ["ts > ?"]
+        params: list = [since_ts]
+
+        if role:
+            conditions.append("role = ?")
+            params.append(role)
+        if channel:
+            conditions.append("channel = ?")
+            params.append(channel)
+
+        where = " AND ".join(conditions)
+        params.append(limit)
+
+        try:
+            cur = self._conn.cursor()
+            cur.execute(
+                f"SELECT ts, role, content, session_id, channel "
+                f"FROM messages WHERE {where} ORDER BY ts ASC LIMIT ?",
+                params,
+            )
+            rows = cur.fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        return [
+            {"ts": ts, "role": role_, "content": content,
+             "session_id": sid, "channel": ch}
+            for ts, role_, content, sid, ch in rows
+        ]
+
     @staticmethod
     def _fts_query(query: str) -> str:
         """

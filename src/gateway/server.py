@@ -53,7 +53,7 @@ app.include_router(landingpage_router, tags=["网页界面"])
 from channels.feishu import router as feishu_router
 app.include_router(feishu_router, prefix="/feishu", tags=["飞书"])
 
-from gateway.web import router as web_router
+from channels.web import router as web_router
 app.include_router(web_router, prefix="/api", tags=["Web API"])
 
 # ── 健康检查 ───────────────────────────────────────────────────────────────────

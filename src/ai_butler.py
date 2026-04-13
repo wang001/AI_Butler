@@ -156,6 +156,10 @@ class AIButlerApp:
         self._running = True
         loop_task = asyncio.create_task(self._agent_loop(), name="agent-loop")
 
+        memory_cron = getattr(self.butler, "_memory_update_service", None)
+        if memory_cron:
+            memory_cron.start()
+
         try:
             if mode == "cli":
                 await self._start_cli(cli_hook)

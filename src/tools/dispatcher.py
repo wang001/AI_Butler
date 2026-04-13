@@ -65,6 +65,7 @@ _TIME_TOOLS: list[dict] = [
 TOOL_CONCURRENT_SAFE: dict[str, bool] = {
     "search_memory":    True,   # 只读：向量检索
     "search_history":   True,   # 只读：SQLite FTS 查询
+    "update_memory":    False,  # 写 MEMORY.md，必须串行独占
     "get_current_time": True,   # 纯计算，无 IO
     "web_search":       True,   # 只读：外部搜索引擎
     "read_file":        True,   # 只读：本地文件读取
@@ -102,15 +103,21 @@ class ToolDispatcher:
         command_executor: Any = None,  # tools.command.CommandExecutor 实例，None 表示禁用
         browser_agent: Any = None,     # tools.browser.BrowserAgent 实例，None 表示禁用
         working_dir: str | None = None,
+        memory_update_service: Any = None,
+        memory_tools: list[dict] | None = None,
     ):
-        self.memory = MemoryTools(reme=reme, history=history)
+        self.memory = MemoryTools(
+            reme=reme,
+            history=history,
+            memory_update_service=memory_update_service,
+        )
         self.command_executor = command_executor
         self.browser_agent = browser_agent
         self._working_dir = Path(working_dir) if working_dir else Path.cwd()
 
         # 根据实际启用的工具动态构建 schema 列表
         self.tools: list[dict] = (
-            MEMORY_TOOLS
+            (memory_tools if memory_tools is not None else MEMORY_TOOLS)
             + SEARCH_TOOLS
             + FILE_READER_TOOLS
             + _TIME_TOOLS
@@ -163,6 +170,8 @@ class ToolDispatcher:
             result = await self.memory.search_memory(**args)
         elif name == "search_history":
             result = self.memory.search_history(**args)
+        elif name == "update_memory":
+            result = await self.memory.update_memory(**args)
         elif name == "get_current_time":
             result = self._get_current_time(**args)
         elif name == "web_search":

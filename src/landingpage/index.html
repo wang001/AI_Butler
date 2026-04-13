@@ -198,17 +198,17 @@
 
     /* ── 工具调用卡片 ── */
     .tool-card {
-      align-self: flex-start;
+      flex: 1 1 auto;
+      min-width: 0;
       background: #fff;
       border: 1px solid #e2e8f0;
       border-left: 3px solid #6366f1;   /* 左侧紫色强调条（执行中） */
       border-radius: 8px;
-      margin-left: 38px;
-      max-width: calc(100% - 54px);
       overflow: hidden;
       cursor: pointer;
       transition: border-color .18s, box-shadow .18s;
       user-select: none;
+      min-height: 36px;
     }
     .tool-card:hover {
       border-color: #a5b4fc;
@@ -514,30 +514,34 @@
       ? JSON.stringify(args, null, 2)
       : '// 无参数';
 
-    const el = document.createElement('div');
-    el.className = 'tool-card';
-    el.dataset.tool = name;
-    el.innerHTML = `
-      <div class="tc-header">
-        <div class="tc-icon">
-          <div class="spinner"></div>
-          <i class="check">✓</i>
+    const row = document.createElement('div');
+    row.className = 'msg assistant tool-msg';
+    row.innerHTML = `
+      <div class="bubble-avatar">🤖</div>
+      <div class="tool-card" data-tool="${escapeHtml(name)}">
+        <div class="tc-header">
+          <div class="tc-icon">
+            <div class="spinner"></div>
+            <i class="check">✓</i>
+          </div>
+          <span class="tc-label">调用&nbsp;</span>
+          <span class="tc-name">${escapeHtml(name)}</span>
+          <span class="tc-label tc-status-text">&nbsp;执行中…</span>
+          <span class="tc-arrow">▶</span>
         </div>
-        <span class="tc-label">调用&nbsp;</span>
-        <span class="tc-name">${escapeHtml(name)}</span>
-        <span class="tc-label tc-status-text">&nbsp;执行中…</span>
-        <span class="tc-arrow">▶</span>
-      </div>
-      <div class="tc-body">
-        <div class="tc-args-title">Parameters</div>
-        <pre>${escapeHtml(argsText)}</pre>
+        <div class="tc-body">
+          <div class="tc-args-title">Parameters</div>
+          <pre>${escapeHtml(argsText)}</pre>
+        </div>
       </div>
     `;
+
+    const el = row.querySelector('.tool-card');
 
     // 点击切换展开/折叠
     el.addEventListener('click', () => el.classList.toggle('expanded'));
 
-    messagesEl.appendChild(el);
+    messagesEl.appendChild(row);
     // 入队：同名工具按调用顺序排队
     if (!_toolCardMap.has(name)) _toolCardMap.set(name, []);
     _toolCardMap.get(name).push(el);

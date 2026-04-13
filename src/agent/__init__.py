@@ -154,6 +154,14 @@ class Butler:
             channel=channel,
         )
 
+        from cron import MemoryUpdateService
+        memory_update_service = MemoryUpdateService(
+            cfg=cfg,
+            history=history,
+            reme=memory.reme,
+            llm_model=cfg.llm_model,
+        )
+
         command_executor = None
         if cfg.command_enabled:
             try:
@@ -186,6 +194,7 @@ class Butler:
             command_executor=command_executor,
             browser_agent=browser_agent,
             working_dir=cfg.working_dir,
+            memory_update_service=memory_update_service,
         )
 
         runner = AgentRunner(
@@ -200,7 +209,7 @@ class Butler:
             memory=memory,
         )
 
-        return cls(
+        inst = cls(
             cfg=cfg,
             memory=memory,
             history=history,
@@ -210,6 +219,8 @@ class Butler:
             session_id=session_id,
             channel=channel,
         )
+        inst._memory_update_service = memory_update_service
+        return inst
 
     async def chat(self, user_input: str) -> str:
         """
@@ -277,6 +288,9 @@ class Butler:
                 await self._dispatcher.browser_agent.close()
             except Exception:
                 pass
+
+        if getattr(self, "_memory_update_service", None):
+            await self._memory_update_service.stop()
 
         await self._memory.settle(self._messages)
         await self._memory.close()
