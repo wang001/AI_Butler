@@ -18,7 +18,7 @@ Tool Call 调度器
   False = 有写操作或共享有状态资源，必须独占串行执行
 
 结果溢出策略（_spill_to_file）：
-  工具返回结果超过字符上限时，将完整内容写入 working_dir/tool_results/<工具名>_<时间戳>.txt，
+  工具返回结果超过字符上限时，将完整内容写入 tool_call_dir/<工具名>_<时间戳>.txt，
   并返回文件路径提示，让模型通过 read_file 工具按需读取，避免截断导致信息丢失。
 """
 import json
@@ -89,7 +89,7 @@ class ToolDispatcher:
 
     结果溢出策略：
       结果字符数超过 _RESULT_CHAR_LIMIT 时，完整内容写入
-      <working_dir>/tool_results/<tool>_<timestamp>.txt，
+      <tool_call_dir>/<tool>_<timestamp>.txt，
       返回给模型的是文件路径提示，模型可用 read_file 按需读取。
     """
 
@@ -102,7 +102,7 @@ class ToolDispatcher:
         history: Any = None,
         command_executor: Any = None,  # tools.command.CommandExecutor 实例，None 表示禁用
         browser_agent: Any = None,     # tools.browser.BrowserAgent 实例，None 表示禁用
-        working_dir: str | None = None,
+        tool_call_dir: str | None = None,
         memory_update_service: Any = None,
         memory_tools: list[dict] | None = None,
     ):
@@ -113,7 +113,7 @@ class ToolDispatcher:
         )
         self.command_executor = command_executor
         self.browser_agent = browser_agent
-        self._working_dir = Path(working_dir) if working_dir else Path.cwd()
+        self._tool_call_dir = Path(tool_call_dir) if tool_call_dir else Path.cwd()
 
         # 根据实际启用的工具动态构建 schema 列表
         self.tools: list[dict] = (
@@ -129,10 +129,10 @@ class ToolDispatcher:
         """
         将过长的工具结果写入临时文件，返回提示字符串。
 
-        文件保存在 <working_dir>/tool_results/<tool>_<timestamp>.txt，
+        文件保存在 <tool_call_dir>/<tool>_<timestamp>.txt，
         模型可通过 run_command 读取（如 cat、head、grep 等）。
         """
-        out_dir = self._working_dir / "tool_results"
+        out_dir = self._tool_call_dir
         out_dir.mkdir(parents=True, exist_ok=True)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

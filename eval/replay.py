@@ -45,7 +45,7 @@ NO_RESET = "--no-reset" in sys.argv
 
 def get_eval_config() -> Config:
     cfg = Config.from_env()
-    cfg.working_dir = str(EVAL_DATA_DIR)
+    cfg.memory_dir = str(EVAL_DATA_DIR)
     return cfg
 
 
@@ -169,7 +169,7 @@ async def replay():
     print(f"共 {len(days)} 天对话，{total_turns} 轮消息")
 
     # 初始化 ChatHistory
-    history = ChatHistory(data_dir=cfg.working_dir)
+    history = ChatHistory(data_dir=cfg.memory_dir)
 
     # 按天写入文件
     for day in days:
@@ -199,7 +199,7 @@ async def replay():
     from reme.reme_light import ReMeLight
 
     reme = ReMeLight(
-        working_dir=cfg.working_dir,
+        working_dir=cfg.memory_dir,
         llm_api_key=cfg.llm_api_key,
         llm_base_url=cfg.llm_base_url,
         embedding_api_key=cfg.emb_api_key,

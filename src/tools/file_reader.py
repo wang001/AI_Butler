@@ -5,7 +5,7 @@ tools/file_reader.py — 纯文本文件读取工具
 .py / .sh 等。若文件以指定编码解码失败，会提示尝试其他编码或改用 run_command 处理。
 
 供模型通过 Tool Call 读取文本文件内容，主要用于：
-  1. 读取 ToolDispatcher 溢出写入的大结果文件（tool_results/）
+  1. 读取 ToolDispatcher 溢出写入的大结果文件（/data/tool_call/）
   2. 读取工作目录下的配置、日志、数据等文本文件
 
 支持四种读取模式（参数自由组合）：

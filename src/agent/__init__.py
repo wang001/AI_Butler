@@ -137,7 +137,7 @@ class Butler:
         llm = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key)
 
         memory = await MemoryManager.create(
-            working_dir=cfg.working_dir,
+            memory_dir=cfg.memory_dir,
             llm_api_key=cfg.llm_api_key,
             llm_base_url=cfg.llm_base_url,
             llm_model=cfg.llm_model,
@@ -149,7 +149,7 @@ class Butler:
 
         from history import ChatHistory
         history = ChatHistory(
-            data_dir=cfg.working_dir,
+            data_dir=cfg.memory_dir,
             session_id=session_id,
             channel=channel,
         )
@@ -167,7 +167,7 @@ class Butler:
             try:
                 from tools.command import CommandExecutor, CommandConfig
                 command_executor = CommandExecutor(CommandConfig(
-                    workdir=cfg.command_workdir,
+                    workdir=cfg.workspace_dir,
                     default_timeout=cfg.command_default_timeout,
                 ))
             except Exception:
@@ -193,7 +193,7 @@ class Butler:
             history=history,
             command_executor=command_executor,
             browser_agent=browser_agent,
-            working_dir=cfg.working_dir,
+            tool_call_dir=cfg.tool_call_dir,
             memory_update_service=memory_update_service,
         )
 

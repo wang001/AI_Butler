@@ -29,9 +29,9 @@ class MemoryUpdateService:
         self._history = history
         self._reme = reme
         self._llm_model = llm_model
-        self._working_dir = Path(cfg.working_dir)
-        self._memory_path = self._working_dir / "MEMORY.md"
-        self._meta_path = self._working_dir / ".memory_update_meta.json"
+        self._memory_dir = Path(cfg.memory_dir)
+        self._memory_path = self._memory_dir / "MEMORY.md"
+        self._meta_path = self._memory_dir / ".memory_update_meta.json"
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
 
@@ -153,7 +153,7 @@ class MemoryUpdateService:
             history=self._history,
             command_executor=None,
             browser_agent=None,
-            working_dir=self._cfg.working_dir,
+            tool_call_dir=self._cfg.tool_call_dir,
             memory_update_service=self,
             memory_tools=MEMORY_READONLY_TOOLS,
         )
@@ -185,7 +185,7 @@ class MemoryUpdateService:
             return ""
 
     def _write_memory(self, content: str) -> None:
-        self._working_dir.mkdir(parents=True, exist_ok=True)
+        self._memory_dir.mkdir(parents=True, exist_ok=True)
         self._memory_path.write_text(content.strip() + "\n", encoding="utf-8")
 
     def _load_last_update_ts(self) -> float:
@@ -196,7 +196,7 @@ class MemoryUpdateService:
             return 0.0
 
     def _save_last_update_ts(self, ts: float) -> None:
-        self._working_dir.mkdir(parents=True, exist_ok=True)
+        self._memory_dir.mkdir(parents=True, exist_ok=True)
         self._meta_path.write_text(
             json.dumps({"last_update_ts": ts, "saved_at": time.time()}, ensure_ascii=False, indent=2),
             encoding="utf-8",

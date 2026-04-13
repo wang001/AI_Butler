@@ -14,7 +14,16 @@ class Config:
     emb_api_key: str = ""
     emb_model: str = ""
 
-    working_dir: str = "./data/memory"
+    # ── 目录定义（容器内路径） ─────────────────────────────────────────────
+    # /data：内部持久化数据目录，存放记忆、历史、索引等 Butler 自身数据
+    data_dir: str = "/data"
+    # /data/memory：长期记忆与历史存储目录（MEMORY.md、chat_history、索引等）
+    memory_dir: str = "/data/memory"
+    # /data/tool_call：工具返回结果溢出后的落盘目录
+    tool_call_dir: str = "/data/tool_call"
+    # /workspace：命令执行工作区，也是 Agent 产出/下载文件的默认存放目录
+    workspace_dir: str = "/workspace"
+
     max_input_length: int = 128000
     compact_ratio: float = 0.7
     memory_compact_reserve: int = 10000
@@ -27,7 +36,6 @@ class Config:
 
     # ── 命令执行配置（容器内直接 subprocess 执行） ──
     command_enabled: bool = True
-    command_workdir: str = "/workspace"
     command_default_timeout: int = 30
 
     # ── browser-use 配置 ──
@@ -37,6 +45,11 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        data_dir = os.getenv("DATA_DIR", "/data")
+        memory_dir = os.getenv("MEMORY_DIR", f"{data_dir.rstrip('/')}/memory")
+        tool_call_dir = os.getenv("TOOL_CALL_DIR", f"{data_dir.rstrip('/')}/tool_call")
+        workspace_dir = os.getenv("WORKSPACE_DIR", "/workspace")
+
         return cls(
             llm_base_url=os.getenv("LLM_BASE_URL", ""),
             llm_api_key=os.getenv("LLM_API_KEY", ""),
@@ -44,12 +57,14 @@ class Config:
             emb_base_url=os.getenv("EMB_BASE_URL", ""),
             emb_api_key=os.getenv("EMB_API_KEY", ""),
             emb_model=os.getenv("EMB_MODEL", ""),
-            working_dir=os.getenv("WORKING_DIR", "/data/memory"),
+            data_dir=data_dir,
+            memory_dir=memory_dir,
+            tool_call_dir=tool_call_dir,
+            workspace_dir=workspace_dir,
             memory_similarity_threshold=float(
-                os.getenv("MEMORY_SIMILARITY_THRESHOLD", "0.75")
+                os.getenv("MEMORY_SIMILARITY_THRESHOLD", "0.5")
             ),
             command_enabled=os.getenv("COMMAND_ENABLED", "true").lower() == "true",
-            command_workdir=os.getenv("COMMAND_WORKDIR", "/workspace"),
             command_default_timeout=int(os.getenv("COMMAND_DEFAULT_TIMEOUT", "30")),
             browser_enabled=os.getenv("BROWSER_ENABLED", "true").lower() == "true",
             browser_headless=os.getenv("BROWSER_HEADLESS", "true").lower() == "true",

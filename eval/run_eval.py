@@ -85,9 +85,9 @@ SIMILARITY_THRESHOLD = 0.5
 
 
 def get_eval_config() -> Config:
-    """复用生产 .env，只替换 working_dir 为评测专用路径。"""
+    """复用生产 .env，只替换 memory_dir 为评测专用路径。"""
     cfg = Config.from_env()
-    cfg.working_dir = str(EVAL_DATA_DIR)
+    cfg.memory_dir = str(EVAL_DATA_DIR)
     return cfg
 
 
@@ -293,7 +293,7 @@ async def run_eval():
     from tools import TOOLS, ToolExecutor
 
     reme = ReMeLight(
-        working_dir=cfg.working_dir,
+        working_dir=cfg.memory_dir,
         llm_api_key=cfg.llm_api_key,
         llm_base_url=cfg.llm_base_url,
         embedding_api_key=cfg.emb_api_key,
@@ -307,7 +307,7 @@ async def run_eval():
     print("ReMe 已启动")
 
     # 初始化评测专用 ChatHistory（让模型可以调 search_history）
-    history = ChatHistory(data_dir=cfg.working_dir)
+    history = ChatHistory(data_dir=cfg.memory_dir)
 
     llm = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key)
 

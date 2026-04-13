@@ -57,9 +57,9 @@ class MemoryManager:
     的全部交互逻辑，对外仅暴露 dict 格式接口。
     """
 
-    def __init__(self, reme: Any, working_dir: str, similarity_threshold: float = 0.5):
+    def __init__(self, reme: Any, memory_dir: str, similarity_threshold: float = 0.5):
         self._reme = reme
-        self._working_dir = Path(working_dir)
+        self._memory_dir = Path(memory_dir)
         self._similarity_threshold = similarity_threshold
 
     @property
@@ -70,7 +70,7 @@ class MemoryManager:
     @classmethod
     async def create(
         cls,
-        working_dir: str,
+        memory_dir: str,
         llm_api_key: str,
         llm_base_url: str,
         llm_model: str,
@@ -85,7 +85,7 @@ class MemoryManager:
         from reme.reme_light import ReMeLight
 
         reme = ReMeLight(
-            working_dir=working_dir,
+            working_dir=memory_dir,
             llm_api_key=llm_api_key,
             llm_base_url=llm_base_url,
             embedding_api_key=emb_api_key,
@@ -99,7 +99,7 @@ class MemoryManager:
 
         return cls(
             reme=reme,
-            working_dir=working_dir,
+            memory_dir=memory_dir,
             similarity_threshold=similarity_threshold,
         )
 
@@ -165,7 +165,7 @@ class MemoryManager:
     def read_memory_md(self) -> str:
         """读取 MEMORY.md 用户画像文件，不存在时返回空串。"""
         try:
-            f = self._working_dir / "MEMORY.md"
+            f = self._memory_dir / "MEMORY.md"
             return f.read_text(encoding="utf-8") if f.exists() else ""
         except Exception:
             return ""
