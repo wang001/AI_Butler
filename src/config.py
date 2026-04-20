@@ -43,6 +43,12 @@ class Config:
     browser_headless: bool = True
     browser_max_steps: int = 20
 
+    # ── 飞书 Channel 配置 ──
+    feishu_app_id: str = ""
+    feishu_app_secret: str = ""
+    feishu_sign_secret: str = ""      # 事件订阅签名密钥（Verification Token）
+    feishu_bot_name: str = ""         # 机器人名称（群聊 @ 过滤用）
+
     @classmethod
     def from_env(cls) -> "Config":
         data_dir = os.getenv("DATA_DIR", "/data")
@@ -69,4 +75,8 @@ class Config:
             browser_enabled=os.getenv("BROWSER_ENABLED", "true").lower() == "true",
             browser_headless=os.getenv("BROWSER_HEADLESS", "true").lower() == "true",
             browser_max_steps=int(os.getenv("BROWSER_MAX_STEPS", "20")),
+            feishu_app_id=os.getenv("FEISHU_APP_ID", ""),
+            feishu_app_secret=os.getenv("FEISHU_APP_SECRET", ""),
+            feishu_sign_secret=os.getenv("FEISHU_SIGN_SECRET", ""),
+            feishu_bot_name=os.getenv("FEISHU_BOT_NAME", ""),
         )

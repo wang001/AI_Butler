@@ -19,3 +19,6 @@ playwright>=1.40.0
 # gateway 模式：FastAPI + uvicorn 异步 HTTP 服务
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
+
+# 飞书 Channel：异步 HTTP 客户端（调用飞书 OpenAPI）
+aiohttp>=3.9.0
