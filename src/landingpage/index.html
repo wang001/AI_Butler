@@ -16,6 +16,8 @@
       align-items: center;
       justify-content: center;
     }
+    body.hide-reasoning .reasoning-msg { display: none; }
+    body.hide-tool-details .tool-msg { display: none; }
 
     /* ── 聊天窗口 ── */
     .chat-window {
@@ -46,8 +48,29 @@
     }
     .chat-header .title { font-size: 16px; font-weight: 600; }
     .chat-header .subtitle { font-size: 12px; opacity: .6; margin-top: 2px; }
-    .chat-header .status {
+    .chat-header .header-actions {
       margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .chat-header .header-btn {
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.08);
+      color: #fff;
+      border-radius: 999px;
+      padding: 7px 12px;
+      font-size: 12px;
+      line-height: 1;
+      cursor: pointer;
+      transition: background .2s, border-color .2s, transform .12s;
+    }
+    .chat-header .header-btn:hover {
+      background: rgba(255,255,255,.14);
+      border-color: rgba(255,255,255,.24);
+    }
+    .chat-header .header-btn:active { transform: scale(.98); }
+    .chat-header .status {
       width: 8px; height: 8px;
       border-radius: 50%;
       background: #4ade80;
@@ -135,12 +158,18 @@
     /* ── 输入区 ── */
     .input-area {
       display: flex;
-      align-items: flex-end;
-      gap: 10px;
+      flex-direction: column;
+      gap: 8px;
       padding: 12px 16px;
       border-top: 1px solid #e5e7eb;
       background: #fff;
       flex-shrink: 0;
+    }
+    .input-row {
+      position: relative;
+      display: flex;
+      align-items: flex-end;
+      gap: 10px;
     }
     .input-area textarea {
       flex: 1;
@@ -157,7 +186,7 @@
       overflow-y: auto;
     }
     .input-area textarea:focus { border-color: #4f46e5; }
-    .input-area button {
+    #sendBtn {
       flex-shrink: 0;
       width: 40px; height: 40px;
       border: none;
@@ -168,10 +197,289 @@
       display: flex; align-items: center; justify-content: center;
       transition: background .2s, transform .1s;
     }
-    .input-area button:hover { background: #4338ca; }
-    .input-area button:active { transform: scale(.92); }
-    .input-area button:disabled { background: #c7d2fe; cursor: not-allowed; }
-    .input-area button svg { width: 18px; height: 18px; }
+    #sendBtn:hover { background: #4338ca; }
+    #sendBtn:active { transform: scale(.92); }
+    #sendBtn:disabled { background: #c7d2fe; cursor: not-allowed; }
+    #sendBtn svg { width: 18px; height: 18px; }
+    .composer-hint {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      color: #94a3b8;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .slash-menu {
+      position: absolute;
+      left: 0;
+      right: 50px;
+      bottom: calc(100% + 10px);
+      z-index: 8;
+      border: 1px solid #e2e8f0;
+      border-radius: 16px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.98), rgba(248,250,252,.98));
+      box-shadow: 0 18px 42px rgba(15,23,42,.18);
+      overflow: hidden;
+      display: none;
+      backdrop-filter: blur(12px);
+    }
+    .slash-menu.show { display: block; }
+    .slash-menu-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 11px 14px 10px;
+      border-bottom: 1px solid #eef2ff;
+      background: rgba(99,102,241,.05);
+    }
+    .slash-menu-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: #3730a3;
+      letter-spacing: .01em;
+    }
+    .slash-menu-tip {
+      font-size: 11px;
+      color: #94a3b8;
+    }
+    .slash-menu-list {
+      max-height: 280px;
+      overflow-y: auto;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .slash-menu-item {
+      width: 100%;
+      appearance: none;
+      border: 1px solid transparent;
+      border-radius: 12px;
+      background: transparent;
+      padding: 10px 11px;
+      cursor: pointer;
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      text-align: left;
+      transition: background .16s, border-color .16s, transform .12s;
+    }
+    .slash-menu-item:hover {
+      background: #eef2ff;
+      border-color: #c7d2fe;
+    }
+    .slash-menu-item.active {
+      background: linear-gradient(180deg, #eef2ff, #e0e7ff);
+      border-color: #a5b4fc;
+      transform: translateY(-1px);
+    }
+    .slash-menu-item-command {
+      min-width: 92px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #4338ca;
+      font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
+      line-height: 1.4;
+    }
+    .slash-menu-item-body {
+      flex: 1;
+      min-width: 0;
+    }
+    .slash-menu-item-label {
+      font-size: 13px;
+      font-weight: 700;
+      color: #0f172a;
+      line-height: 1.4;
+    }
+    .slash-menu-item-desc {
+      margin-top: 3px;
+      font-size: 12px;
+      color: #64748b;
+      line-height: 1.5;
+    }
+    .slash-menu-empty {
+      padding: 18px 16px;
+      color: #64748b;
+      font-size: 12px;
+      line-height: 1.6;
+      text-align: center;
+    }
+
+    /* ── 会话抽屉 ── */
+    .session-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15,23,42,.42);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .22s ease;
+    }
+    body.drawer-open .session-backdrop {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .session-drawer {
+      position: fixed;
+      top: 0;
+      left: 0;
+      height: 100dvh;
+      width: min(380px, calc(100vw - 28px));
+      background:
+        linear-gradient(180deg, #111827 0%, #0f172a 100%);
+      color: #e5eefc;
+      box-shadow: 0 16px 48px rgba(15,23,42,.28);
+      transform: translateX(calc(-100% - 12px));
+      transition: transform .24s ease;
+      z-index: 12;
+      display: flex;
+      flex-direction: column;
+    }
+    body.drawer-open .session-drawer {
+      transform: translateX(0);
+    }
+    .session-drawer-header {
+      padding: 18px 18px 14px;
+      border-bottom: 1px solid rgba(148,163,184,.18);
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .session-drawer-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: #f8fafc;
+    }
+    .session-drawer-subtitle {
+      margin-top: 4px;
+      font-size: 12px;
+      color: #94a3b8;
+      line-height: 1.45;
+    }
+    .session-close-btn {
+      border: 1px solid rgba(148,163,184,.2);
+      background: rgba(255,255,255,.04);
+      color: #cbd5e1;
+      border-radius: 999px;
+      width: 30px;
+      height: 30px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .session-close-btn:hover {
+      background: rgba(255,255,255,.08);
+    }
+    .session-drawer-actions {
+      padding: 14px 18px;
+      display: flex;
+      gap: 10px;
+      border-bottom: 1px solid rgba(148,163,184,.12);
+    }
+    .session-primary-btn,
+    .session-secondary-btn {
+      border-radius: 999px;
+      padding: 9px 14px;
+      font-size: 12px;
+      cursor: pointer;
+      border: none;
+      transition: transform .12s, opacity .18s, background .18s;
+    }
+    .session-primary-btn:active,
+    .session-secondary-btn:active { transform: scale(.98); }
+    .session-primary-btn {
+      background: #4f46e5;
+      color: #fff;
+      box-shadow: 0 8px 22px rgba(79,70,229,.24);
+    }
+    .session-primary-btn:hover { background: #4338ca; }
+    .session-secondary-btn {
+      background: rgba(255,255,255,.06);
+      color: #cbd5e1;
+      border: 1px solid rgba(148,163,184,.16);
+    }
+    .session-secondary-btn:hover {
+      background: rgba(255,255,255,.1);
+    }
+    .session-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px 14px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .session-item {
+      border: 1px solid rgba(148,163,184,.16);
+      background: rgba(255,255,255,.04);
+      border-radius: 14px;
+      padding: 13px 14px;
+      cursor: pointer;
+      transition: border-color .18s, background .18s, transform .12s;
+    }
+    .session-item:hover {
+      border-color: rgba(129,140,248,.52);
+      background: rgba(79,70,229,.12);
+    }
+    .session-item.active {
+      border-color: rgba(129,140,248,.72);
+      background: linear-gradient(180deg, rgba(79,70,229,.22), rgba(79,70,229,.08));
+      box-shadow: inset 0 0 0 1px rgba(129,140,248,.24);
+    }
+    .session-item-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .session-item-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #f8fafc;
+      flex: 1;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .session-item-time {
+      font-size: 11px;
+      color: #94a3b8;
+      flex-shrink: 0;
+    }
+    .session-item-preview {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #cbd5e1;
+      line-height: 1.55;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      min-height: 2.9em;
+    }
+    .session-item-meta {
+      margin-top: 9px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      color: #7dd3fc;
+      font-size: 11px;
+    }
+    .session-empty {
+      margin: auto;
+      text-align: center;
+      color: #94a3b8;
+      padding: 28px 18px;
+      line-height: 1.7;
+      font-size: 13px;
+    }
+    .session-loading {
+      color: #94a3b8;
+      font-size: 13px;
+      padding: 18px;
+      text-align: center;
+    }
 
     /* ── 欢迎提示 ── */
     .welcome {
@@ -315,6 +623,71 @@
       background: #fff;
       border-color: #d1fae5;
     }
+    .tc-section + .tc-section { margin-top: 10px; }
+
+    /* ── Reasoning 折叠卡片 ── */
+    .reasoning-card {
+      flex: 1 1 auto;
+      min-width: 0;
+      background: #fff;
+      border: 1px solid #fcd34d;
+      border-left: 3px solid #f59e0b;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .reasoning-card summary {
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      cursor: pointer;
+      user-select: none;
+      color: #92400e;
+      font-size: 13px;
+      min-height: 36px;
+    }
+    .reasoning-card summary::-webkit-details-marker { display: none; }
+    .reasoning-card .rc-icon {
+      width: 16px; height: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      color: #d97706;
+    }
+    .reasoning-card .rc-title { font-weight: 700; }
+    .reasoning-card .rc-status {
+      color: #b45309;
+      font-size: 12px;
+    }
+    .reasoning-card .rc-arrow {
+      margin-left: auto;
+      font-size: 10px;
+      color: #b45309;
+      transition: transform .2s;
+      padding-left: 4px;
+    }
+    .reasoning-card[open] .rc-arrow { transform: rotate(90deg); }
+    .reasoning-card .rc-body {
+      border-top: 1px solid #fde68a;
+      background: #fffbeb;
+      padding: 10px 12px;
+    }
+    .reasoning-card pre {
+      margin: 0;
+      font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
+      font-size: 12px;
+      line-height: 1.7;
+      color: #78350f;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .reasoning-card.done {
+      border-color: #fde68a;
+      border-left-color: #d97706;
+    }
+    .reasoning-card.done .rc-status { color: #92400e; }
 
     @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -337,9 +710,13 @@
     <div class="avatar">🤖</div>
     <div>
       <div class="title">AI 管家</div>
-      <div class="subtitle">随时为您服务</div>
+      <div class="subtitle" id="subtitleText">随时为您服务</div>
     </div>
-    <div class="status offline" id="statusDot" title="连接状态"></div>
+    <div class="header-actions">
+      <button class="header-btn" id="sessionsBtn" title="会话面板">会话</button>
+      <button class="header-btn" id="newSessionBtn" title="新建会话">+ 新建</button>
+      <div class="status offline" id="statusDot" title="连接状态"></div>
+    </div>
   </div>
 
   <!-- 错误提示 -->
@@ -355,35 +732,455 @@
 
   <!-- 输入区 -->
   <div class="input-area">
-    <textarea
-      id="inputBox"
-      placeholder="输入消息，Enter 发送，Shift+Enter 换行…"
-      rows="1"
-    ></textarea>
-    <button id="sendBtn" disabled title="发送">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
-           stroke-linecap="round" stroke-linejoin="round">
-        <line x1="22" y1="2" x2="11" y2="13"/>
-        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-      </svg>
-    </button>
+    <div class="input-row">
+      <div class="slash-menu" id="slashMenu" aria-hidden="true">
+        <div class="slash-menu-header">
+          <span class="slash-menu-title">Slash Commands</span>
+          <span class="slash-menu-tip">↑↓ 选择，Tab 补全，Enter 执行</span>
+        </div>
+        <div class="slash-menu-list" id="slashMenuList"></div>
+      </div>
+      <textarea
+        id="inputBox"
+        placeholder="输入消息，Enter 发送，Shift+Enter 换行，输入 / 打开命令面板…"
+        rows="1"
+      ></textarea>
+      <button id="sendBtn" disabled title="发送">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"/>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </div>
+    <div class="composer-hint">
+      <span>Shift+Enter 换行，Ctrl/Cmd+Enter 也可发送</span>
+      <span>输入 / 打开命令面板</span>
+    </div>
   </div>
 </div>
+
+<div class="session-backdrop" id="sessionBackdrop"></div>
+<aside class="session-drawer" id="sessionDrawer" aria-hidden="true">
+  <div class="session-drawer-header">
+    <div>
+      <div class="session-drawer-title">会话面板</div>
+      <div class="session-drawer-subtitle">切换旧会话，或直接新建一个干净上下文。</div>
+    </div>
+    <button class="session-close-btn" id="closeDrawerBtn" title="关闭">×</button>
+  </div>
+  <div class="session-drawer-actions">
+    <button class="session-primary-btn" id="drawerNewBtn">新建会话</button>
+    <button class="session-secondary-btn" id="refreshSessionsBtn">刷新列表</button>
+  </div>
+  <div class="session-list" id="sessionList">
+    <div class="session-loading">正在加载会话…</div>
+  </div>
+</aside>
 
 <script>
   // ── DOM 引用 ─────────────────────────────────────────────────────────────
   const messagesEl  = document.getElementById('messages');
   const inputBox    = document.getElementById('inputBox');
   const sendBtn     = document.getElementById('sendBtn');
+  const sessionsBtn = document.getElementById('sessionsBtn');
+  const newSessionBtn = document.getElementById('newSessionBtn');
   const statusDot   = document.getElementById('statusDot');
+  const subtitleEl  = document.getElementById('subtitleText');
   const errorBanner = document.getElementById('errorBanner');
+  const sessionDrawer = document.getElementById('sessionDrawer');
+  const sessionBackdrop = document.getElementById('sessionBackdrop');
+  const sessionListEl = document.getElementById('sessionList');
+  const closeDrawerBtn = document.getElementById('closeDrawerBtn');
+  const drawerNewBtn = document.getElementById('drawerNewBtn');
+  const refreshSessionsBtn = document.getElementById('refreshSessionsBtn');
+  const slashMenu = document.getElementById('slashMenu');
+  const slashMenuListEl = document.getElementById('slashMenuList');
+
+  const STORAGE_KEYS = {
+    conversationId: 'ai_butler_conversation_id',
+    showThinking: 'ai_butler_show_thinking',
+    showToolDetails: 'ai_butler_show_tool_details',
+  };
 
   // ── WebSocket 连接 ────────────────────────────────────────────────────────
   const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/ws`;
   let ws = null;
   let isWaiting = false;       // 等待 Butler 回复中
   let welcomeRemoved = false;  // 是否已移除欢迎语
-  let streamingBubble = null;  // 当前流式输出的气泡元素
+  let currentConversationId = localStorage.getItem(STORAGE_KEYS.conversationId) || '';
+  let currentSessionTitle = '新会话';
+  let isSessionDrawerOpen = false;
+  let sessionListCache = [];
+  const uiPrefs = {
+    showThinking: localStorage.getItem(STORAGE_KEYS.showThinking) !== 'false',
+    showToolDetails: localStorage.getItem(STORAGE_KEYS.showToolDetails) !== 'false',
+  };
+  const SLASH_COMMANDS = [
+    {
+      command: '/new',
+      aliases: ['/clear'],
+      label: '新建会话',
+      description: '关闭当前上下文视角，切到一个全新的会话。',
+      completion: '/new',
+    },
+    {
+      command: '/sessions',
+      aliases: [],
+      label: '打开会话面板',
+      description: '查看最近会话列表，手动切换或继续旧上下文。',
+      completion: '/sessions',
+    },
+    {
+      command: '/session',
+      aliases: [],
+      label: '切换指定会话',
+      description: '输入 id 前缀或标题关键词，直接跳转到某个会话。',
+      completion: '/session ',
+    },
+    {
+      command: '/thinking',
+      aliases: [],
+      label: '切换 Thinking',
+      description: '显示或隐藏折叠的思考块，不影响模型能力。',
+      completion: '/thinking',
+    },
+    {
+      command: '/details',
+      aliases: [],
+      label: '切换工具详情',
+      description: '显示或隐藏 tool call / tool result 卡片。',
+      completion: '/details',
+    },
+    {
+      command: '/help',
+      aliases: [],
+      label: '查看命令帮助',
+      description: '列出当前支持的 slash commands。',
+      completion: '/help',
+    },
+  ];
+  const _textBlockMap = new Map();       // text block id → bubble
+  const _reasoningCardMap = new Map();   // reasoning block id → details
+  let slashMenuItems = [];
+  let slashMenuActiveIndex = 0;
+
+  function applyUiPrefs() {
+    document.body.classList.toggle('hide-reasoning', !uiPrefs.showThinking);
+    document.body.classList.toggle('hide-tool-details', !uiPrefs.showToolDetails);
+    localStorage.setItem(STORAGE_KEYS.showThinking, String(uiPrefs.showThinking));
+    localStorage.setItem(STORAGE_KEYS.showToolDetails, String(uiPrefs.showToolDetails));
+  }
+
+  function updateSubtitle() {
+    const commandHint = '输入 / 打开命令面板';
+    if (!currentConversationId) {
+      subtitleEl.textContent = `${commandHint}`;
+      return;
+    }
+    subtitleEl.textContent = `${currentSessionTitle} · ${commandHint}`;
+  }
+
+  function getSlashQuery(rawText = inputBox.value) {
+    const value = String(rawText || '');
+    if (!value.startsWith('/')) return '';
+    if (value.includes('\n')) return '';
+    return value.slice(1).trim().toLowerCase();
+  }
+
+  function getFilteredSlashCommands(rawText = inputBox.value) {
+    const query = getSlashQuery(rawText);
+    if (!String(rawText || '').startsWith('/')) return [];
+    if (!query) return SLASH_COMMANDS;
+    return SLASH_COMMANDS.filter((item) => {
+      const haystacks = [item.command, ...(item.aliases || []), item.label];
+      return haystacks.some((candidate) =>
+        String(candidate || '').toLowerCase().includes(query)
+      );
+    });
+  }
+
+  function hideSlashMenu() {
+    slashMenu.classList.remove('show');
+    slashMenu.setAttribute('aria-hidden', 'true');
+    slashMenuListEl.innerHTML = '';
+    slashMenuItems = [];
+    slashMenuActiveIndex = 0;
+  }
+
+  function renderSlashMenu(items) {
+    slashMenuItems = items;
+    slashMenuActiveIndex = Math.min(slashMenuActiveIndex, Math.max(items.length - 1, 0));
+
+    if (!items.length) {
+      slashMenuListEl.innerHTML = `
+        <div class="slash-menu-empty">
+          没找到匹配命令。<br>
+          输入 <code>/help</code> 查看完整列表。
+        </div>
+      `;
+      slashMenu.classList.add('show');
+      slashMenu.setAttribute('aria-hidden', 'false');
+      return;
+    }
+
+    slashMenuListEl.innerHTML = items.map((item, index) => `
+      <button
+        type="button"
+        class="slash-menu-item${index === slashMenuActiveIndex ? ' active' : ''}"
+        data-command-index="${index}"
+      >
+        <span class="slash-menu-item-command">${escapeHtml(item.command)}</span>
+        <span class="slash-menu-item-body">
+          <span class="slash-menu-item-label">${escapeHtml(item.label)}</span>
+          <span class="slash-menu-item-desc">${escapeHtml(item.description)}</span>
+        </span>
+      </button>
+    `).join('');
+
+    slashMenuListEl.querySelectorAll('.slash-menu-item').forEach((itemEl) => {
+      itemEl.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+        const index = Number(itemEl.dataset.commandIndex);
+        applySlashMenuSelection(index, { execute: false });
+      });
+      itemEl.addEventListener('click', () => {
+        const index = Number(itemEl.dataset.commandIndex);
+        applySlashMenuSelection(index, { execute: true });
+      });
+    });
+
+    slashMenu.classList.add('show');
+    slashMenu.setAttribute('aria-hidden', 'false');
+  }
+
+  function updateSlashMenu() {
+    const value = inputBox.value;
+    if (!value.startsWith('/')) {
+      hideSlashMenu();
+      return;
+    }
+    renderSlashMenu(getFilteredSlashCommands(value));
+  }
+
+  function applySlashMenuSelection(index, { execute = false } = {}) {
+    if (!slashMenuItems.length) return false;
+    const item = slashMenuItems[index];
+    if (!item) return false;
+    slashMenuActiveIndex = index;
+    inputBox.value = item.completion;
+    autoResize();
+    updateSlashMenu();
+    inputBox.focus();
+    if (execute) {
+      void sendMessage();
+    }
+    return true;
+  }
+
+  function moveSlashMenuSelection(direction) {
+    if (!slashMenuItems.length) return false;
+    const nextIndex =
+      (slashMenuActiveIndex + direction + slashMenuItems.length) % slashMenuItems.length;
+    slashMenuActiveIndex = nextIndex;
+    renderSlashMenu(slashMenuItems);
+    const active = slashMenuListEl.querySelector('.slash-menu-item.active');
+    active?.scrollIntoView({ block: 'nearest' });
+    return true;
+  }
+
+  function setCurrentSession(session) {
+    currentConversationId = session?.id || '';
+    currentSessionTitle = session?.title || '新会话';
+    if (currentConversationId) {
+      localStorage.setItem(STORAGE_KEYS.conversationId, currentConversationId);
+    } else {
+      localStorage.removeItem(STORAGE_KEYS.conversationId);
+    }
+    updateSubtitle();
+  }
+
+  async function createSession(title = '新会话') {
+    const resp = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (!resp.ok) {
+      throw new Error(`创建会话失败：${resp.status}`);
+    }
+    return await resp.json();
+  }
+
+  async function fetchSession(sessionId) {
+    const resp = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    if (!resp.ok) return null;
+    const payload = await resp.json();
+    return payload.session || null;
+  }
+
+  async function fetchSessions(limit = 80) {
+    const resp = await fetch(`/api/sessions?limit=${limit}`);
+    if (!resp.ok) {
+      throw new Error(`读取会话列表失败：${resp.status}`);
+    }
+    const payload = await resp.json();
+    return Array.isArray(payload.sessions) ? payload.sessions : [];
+  }
+
+  async function fetchSessionMessages(sessionId) {
+    const resp = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/messages?limit=200`);
+    if (!resp.ok) return [];
+    const payload = await resp.json();
+    return Array.isArray(payload.messages) ? payload.messages : [];
+  }
+
+  function formatSessionTime(ts) {
+    if (!ts) return '';
+    const date = new Date(ts * 1000);
+    if (Number.isNaN(date.getTime())) return '';
+    const now = new Date();
+    const sameDay =
+      now.getFullYear() === date.getFullYear() &&
+      now.getMonth() === date.getMonth() &&
+      now.getDate() === date.getDate();
+    if (sameDay) {
+      return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    }
+    return date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+  }
+
+  function renderSessionList(sessions) {
+    sessionListCache = sessions;
+    if (!sessions.length) {
+      sessionListEl.innerHTML = `
+        <div class="session-empty">
+          还没有可切换的会话。<br>
+          先发起一轮对话，或者点“新建会话”开始。
+        </div>
+      `;
+      return;
+    }
+
+    sessionListEl.innerHTML = sessions.map((session) => {
+      const title = escapeHtml(session.title || '新会话');
+      const preview = escapeHtml(session.preview || '还没有摘要，点进去继续聊。');
+      const active = session.id === currentConversationId ? ' active' : '';
+      const timeText = escapeHtml(formatSessionTime(session.last_active_at || session.updated_at));
+      const statusText = escapeHtml(session.status || 'active');
+      return `
+        <div class="session-item${active}" data-session-id="${escapeHtml(session.id)}">
+          <div class="session-item-head">
+            <div class="session-item-title">${title}</div>
+            <div class="session-item-time">${timeText}</div>
+          </div>
+          <div class="session-item-preview">${preview}</div>
+          <div class="session-item-meta">
+            <span>${statusText}</span>
+            <span>${escapeHtml(session.id.slice(0, 8))}</span>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    sessionListEl.querySelectorAll('.session-item').forEach((item) => {
+      item.addEventListener('click', () => {
+        const sessionId = item.dataset.sessionId;
+        if (!sessionId) return;
+        void switchConversation(sessionId);
+      });
+    });
+  }
+
+  function openSessionDrawer() {
+    isSessionDrawerOpen = true;
+    document.body.classList.add('drawer-open');
+    sessionDrawer.setAttribute('aria-hidden', 'false');
+  }
+
+  function closeSessionDrawer() {
+    isSessionDrawerOpen = false;
+    document.body.classList.remove('drawer-open');
+    sessionDrawer.setAttribute('aria-hidden', 'true');
+  }
+
+  async function refreshSessionList() {
+    sessionListEl.innerHTML = '<div class="session-loading">正在加载会话…</div>';
+    try {
+      const sessions = await fetchSessions();
+      renderSessionList(sessions);
+    } catch (e) {
+      sessionListEl.innerHTML = `
+        <div class="session-empty">
+          ${escapeHtml(e?.message || '加载会话失败')}
+        </div>
+      `;
+    }
+  }
+
+  async function refreshCurrentSessionMeta() {
+    if (!currentConversationId) return;
+    const session = await fetchSession(currentConversationId);
+    if (session) {
+      setCurrentSession(session);
+      if (isSessionDrawerOpen) {
+        await refreshSessionList();
+      }
+    }
+  }
+
+  async function switchConversation(sessionId) {
+    if (!sessionId || sessionId === currentConversationId) {
+      closeSessionDrawer();
+      return;
+    }
+    if (isWaiting) {
+      showError('当前回复还没结束，先等这轮完成再切换会话。');
+      return;
+    }
+    const session = await fetchSession(sessionId);
+    if (!session) {
+      showError('会话不存在或已失效。');
+      return;
+    }
+    setCurrentSession(session);
+    await loadConversationHistory(sessionId);
+    closeSessionDrawer();
+    inputBox.focus();
+  }
+
+  async function createAndSwitchSession(title = '新会话', showToast = true) {
+    if (isWaiting) {
+      showError('当前回复还没结束，稍等一下再新建会话。');
+      return null;
+    }
+    const created = await createSession(title);
+    setCurrentSession(created);
+    resetConversationView({ showWelcomeCard: true });
+    if (showToast) {
+      appendLocalInfo(`已切换到新会话：${currentSessionTitle}`);
+    }
+    if (isSessionDrawerOpen) {
+      await refreshSessionList();
+      closeSessionDrawer();
+    }
+    inputBox.focus();
+    return created;
+  }
+
+  async function ensureSession() {
+    if (currentConversationId) {
+      const existing = await fetchSession(currentConversationId);
+      if (existing) {
+        setCurrentSession(existing);
+        await loadConversationHistory(currentConversationId);
+        await refreshSessionList();
+        return;
+      }
+    }
+    await createAndSwitchSession('新会话', false);
+    await refreshSessionList();
+  }
 
   function connect() {
     ws = new WebSocket(WS_URL);
@@ -399,8 +1196,7 @@
       statusDot.classList.add('offline');
       statusDot.title = '已断开';
       sendBtn.disabled = true;
-      // 若断开时还在流式输出中，保留气泡内容但移除光标
-      finalizeStreamingBubble();
+      cleanupPendingAssistantUi('已中断');
       if (isWaiting) {
         // 工具执行期间断连：提示用户，重置等待状态（不会重复发送）
         isWaiting = false;
@@ -422,42 +1218,98 @@
       } catch (e) {
         // 非 JSON 的裸文本（向后兼容）直接追加
         removeTypingIndicator();
-        appendStreamToken(ev.data);
+        appendTextDelta('legacy-text', ev.data);
+        return;
+      }
+
+      if (
+        frame.conversationId &&
+        currentConversationId &&
+        frame.conversationId !== currentConversationId
+      ) {
         return;
       }
 
       switch (frame.type) {
+        case 'start':
+        case 'start-step':
+          break;
+        case 'text-start':
+          removeTypingIndicator();
+          ensureTextBlock(frame.id);
+          break;
+        case 'text-delta':
+          removeTypingIndicator();
+          appendTextDelta(frame.id, frame.delta || '');
+          break;
+        case 'text-end':
+          finalizeTextBlock(frame.id);
+          break;
+        case 'text_delta':
         case 'token':
           removeTypingIndicator();
-          appendStreamToken(frame.text);
+          appendTextDelta('legacy-text', frame.text || '');
+          break;
+        case 'reasoning-start':
+          appendReasoningStart(frame.id);
+          break;
+        case 'reasoning-delta':
+          appendReasoningDelta(frame.id, frame.delta || '');
+          break;
+        case 'reasoning-end':
+          finalizeReasoningBlock(frame.id);
+          break;
+        case 'reasoning_delta':
+          appendReasoningDelta('legacy-reasoning', frame.text || '');
+          break;
+        case 'tool-input-start':
+          removeTypingIndicator();
+          appendToolCard(frame.toolCallId, frame.toolName);
+          break;
+        case 'tool-input-delta':
+          appendToolInputDelta(frame.toolCallId, frame.inputTextDelta || '');
+          break;
+        case 'tool-input-available':
+          finalizeToolInput(frame.toolCallId, frame.input || {});
+          break;
+        case 'tool-output-available':
+          finalizeToolOutput(frame.toolCallId, frame.output || {});
           break;
         case 'tool_call':
           removeTypingIndicator();
-          appendToolCard(frame.name, frame.args || {});
+          appendToolCard(frame.call_id, frame.name);
+          finalizeToolInput(frame.call_id, frame.args || {});
           break;
         case 'tool_result':
-          finalizeToolCard(frame.name);
+          finalizeToolOutput(frame.call_id, {
+            preview: frame.preview || '',
+            truncated: Boolean(frame.truncated),
+          });
           break;
+        case 'finish-step':
+          finalizeAllReasoningBlocks();
+          break;
+        case 'finish':
         case 'done':
-          finalizeStreamingBubble();
+          cleanupPendingAssistantUi();
           isWaiting = false;
           sendBtn.disabled = false;
           inputBox.focus();
+          void refreshCurrentSessionMeta();
+          void refreshSessionList();
           break;
         case 'ping':
           // 服务端保活帧，忽略即可
           break;
         case 'error':
-          finalizeStreamingBubble();
-          appendMessage('assistant', `[错误] ${frame.message}`);
+          cleanupPendingAssistantUi('已中断');
+          appendMessage('assistant', `[错误] ${frame.errorText || frame.message}`);
           isWaiting = false;
           sendBtn.disabled = false;
           break;
       }
     };
   }
-
-  connect();
 
   // ── 消息渲染 ──────────────────────────────────────────────────────────────
   function removeWelcome() {
@@ -468,57 +1320,157 @@
     }
   }
 
-  /** 新建或追加到流式气泡（逐 token 拼接） */
-  function appendStreamToken(token) {
-    if (!streamingBubble) {
-      removeWelcome();
-      const msg = document.createElement('div');
-      msg.className = 'msg assistant streaming';
-      msg.innerHTML = `
-        <div class="bubble-avatar">🤖</div>
-        <div class="bubble"></div>
-      `;
-      messagesEl.appendChild(msg);
-      streamingBubble = msg.querySelector('.bubble');
-      scrollToBottom();
-    }
-    // 以纯文本追加（保留换行，防 XSS）
-    streamingBubble.appendChild(document.createTextNode(token));
+  function showWelcome() {
+    messagesEl.innerHTML = `
+      <div class="welcome">
+        <div class="icon">✨</div>
+        <p>你好！我是你的 AI 管家。<br>有什么我可以帮你的吗？</p>
+      </div>
+    `;
+    welcomeRemoved = false;
+  }
+
+  function resetConversationView({ showWelcomeCard = true } = {}) {
+    cleanupPendingAssistantUi();
+    _toolCardMap.clear();
+    messagesEl.innerHTML = '';
+    if (showWelcomeCard) showWelcome();
+    hideError();
     scrollToBottom();
   }
 
-  /** 流式结束：移除 streaming 标记，清空引用 */
-  function finalizeStreamingBubble() {
-    if (streamingBubble) {
-      streamingBubble.closest('.msg')?.classList.remove('streaming');
-      streamingBubble = null;
+  async function loadConversationHistory(sessionId) {
+    resetConversationView({ showWelcomeCard: true });
+    if (!sessionId) return;
+
+    const rows = await fetchSessionMessages(sessionId);
+    if (!rows.length) return;
+
+    for (const row of rows) {
+      renderPersistedRow(row);
     }
   }
 
+  function ensureTextBlock(id) {
+    const key = id || `text-${Date.now()}`;
+    const existing = _textBlockMap.get(key);
+    if (existing) return existing;
+
+    removeWelcome();
+    const msg = document.createElement('div');
+    msg.className = 'msg assistant streaming';
+    msg.innerHTML = `
+      <div class="bubble-avatar">🤖</div>
+      <div class="bubble"></div>
+    `;
+    messagesEl.appendChild(msg);
+    const bubble = msg.querySelector('.bubble');
+    _textBlockMap.set(key, bubble);
+    scrollToBottom();
+    return bubble;
+  }
+
+  function appendTextDelta(id, token) {
+    if (!token) return;
+    const bubble = ensureTextBlock(id);
+    bubble.appendChild(document.createTextNode(token));
+    scrollToBottom();
+  }
+
+  function finalizeTextBlock(id) {
+    if (!id) return;
+    const bubble = _textBlockMap.get(id);
+    if (!bubble) return;
+    bubble.closest('.msg')?.classList.remove('streaming');
+    _textBlockMap.delete(id);
+  }
+
+  function finalizeAllTextBlocks() {
+    _textBlockMap.forEach((bubble) => {
+      bubble.closest('.msg')?.classList.remove('streaming');
+    });
+    _textBlockMap.clear();
+  }
+
+  function cleanupPendingAssistantUi(reasoningStatus = '已完成') {
+    removeTypingIndicator();
+    finalizeAllTextBlocks();
+    finalizeAllReasoningBlocks(reasoningStatus);
+  }
+
+  function ensureReasoningCard(id) {
+    const key = id || `reasoning-${Date.now()}`;
+    const existing = _reasoningCardMap.get(key);
+    if (existing) return existing;
+
+    removeWelcome();
+    removeTypingIndicator();
+
+    const row = document.createElement('div');
+    row.className = 'msg assistant reasoning-msg';
+    row.innerHTML = `
+      <div class="bubble-avatar">🤖</div>
+      <details class="reasoning-card" open>
+        <summary>
+          <span class="rc-icon">◎</span>
+          <span class="rc-title">Thinking</span>
+          <span class="rc-status">思考中…</span>
+          <span class="rc-arrow">▶</span>
+        </summary>
+        <div class="rc-body">
+          <pre></pre>
+        </div>
+      </details>
+    `;
+    messagesEl.appendChild(row);
+    const card = row.querySelector('.reasoning-card');
+    _reasoningCardMap.set(key, card);
+    return card;
+  }
+
+  function appendReasoningStart(id) {
+    ensureReasoningCard(id);
+  }
+
+  function appendReasoningDelta(id, text) {
+    if (!text) return;
+    const reasoningCard = ensureReasoningCard(id);
+    const pre = reasoningCard.querySelector('pre');
+    pre.appendChild(document.createTextNode(text));
+    scrollToBottom();
+  }
+
+  function finalizeReasoningBlock(id, status = '已完成') {
+    if (!id) return;
+    const reasoningCard = _reasoningCardMap.get(id);
+    if (!reasoningCard) return;
+    reasoningCard.classList.add('done');
+    reasoningCard.open = false;
+    const statusEl = reasoningCard.querySelector('.rc-status');
+    if (statusEl) statusEl.textContent = status;
+    _reasoningCardMap.delete(id);
+  }
+
+  function finalizeAllReasoningBlocks(status = '已完成') {
+    Array.from(_reasoningCardMap.keys()).forEach((id) => finalizeReasoningBlock(id, status));
+  }
+
   // ── 工具调用卡片 ──────────────────────────────────────────────────────────
-  // 同一工具可能在一轮对话中被多次调用（如 browser_use 访问多个 URL），
-  // 用 FIFO 队列保证 TOOL_CALL / TOOL_RESULT 能按顺序一一对应。
-  const _toolCardMap = new Map();  // name → el[]（队列）
+  const _toolCardMap = new Map();  // call_id → el
 
   /**
    * 渲染"工具调用中"卡片（可点击展开参数）
-   * @param {string} name  工具名称
-   * @param {object} args  调用参数（对象）
+   * @param {string} callId 工具调用唯一 ID
+   * @param {string} name   工具名称
    */
-  function appendToolCard(name, args) {
+  function appendToolCard(callId, name) {
     removeWelcome();
-
-    // 格式化参数 JSON（无参数时显示占位）
-    const hasArgs = args && Object.keys(args).length > 0;
-    const argsText = hasArgs
-      ? JSON.stringify(args, null, 2)
-      : '// 无参数';
 
     const row = document.createElement('div');
     row.className = 'msg assistant tool-msg';
     row.innerHTML = `
       <div class="bubble-avatar">🤖</div>
-      <div class="tool-card" data-tool="${escapeHtml(name)}">
+      <div class="tool-card" data-tool="${escapeHtml(name)}" data-call-id="${escapeHtml(callId || '')}">
         <div class="tc-header">
           <div class="tc-icon">
             <div class="spinner"></div>
@@ -530,8 +1482,14 @@
           <span class="tc-arrow">▶</span>
         </div>
         <div class="tc-body">
-          <div class="tc-args-title">Parameters</div>
-          <pre>${escapeHtml(argsText)}</pre>
+          <div class="tc-section">
+            <div class="tc-args-title">Parameters</div>
+            <pre class="tc-input-pre">// 生成中...</pre>
+          </div>
+          <div class="tc-section tc-result-wrap" hidden>
+            <div class="tc-args-title">Result Preview</div>
+            <pre class="tc-result-pre"></pre>
+          </div>
         </div>
       </div>
     `;
@@ -542,21 +1500,86 @@
     el.addEventListener('click', () => el.classList.toggle('expanded'));
 
     messagesEl.appendChild(row);
-    // 入队：同名工具按调用顺序排队
-    if (!_toolCardMap.has(name)) _toolCardMap.set(name, []);
-    _toolCardMap.get(name).push(el);
+    if (callId) _toolCardMap.set(callId, el);
     scrollToBottom();
   }
 
-  /** 工具执行完毕：FIFO 出队，将最早的同名卡片切换为"已完成"状态 */
-  function finalizeToolCard(name) {
-    const queue = _toolCardMap.get(name);
-    if (!queue || queue.length === 0) return;
-    const el = queue.shift();                   // FIFO：取最早的那张卡
-    if (queue.length === 0) _toolCardMap.delete(name);
+  function appendToolInputDelta(callId, delta) {
+    if (!callId || !delta) return;
+    const el = _toolCardMap.get(callId);
+    if (!el) return;
+    const pre = el.querySelector('.tc-input-pre');
+    if (!pre) return;
+    if (pre.textContent === '// 生成中...') pre.textContent = '';
+    pre.appendChild(document.createTextNode(delta));
+    scrollToBottom();
+  }
+
+  function finalizeToolInput(callId, input) {
+    if (!callId) return;
+    const el = _toolCardMap.get(callId);
+    if (!el) return;
+    const pre = el.querySelector('.tc-input-pre');
+    if (!pre) return;
+    const hasInput = input && Object.keys(input).length > 0;
+    pre.textContent = hasInput ? JSON.stringify(input, null, 2) : '{}';
+  }
+
+  /** 工具执行完毕：按 call_id 精确回填结果 */
+  function finalizeToolOutput(callId, output) {
+    if (!callId) return;
+    const el = _toolCardMap.get(callId);
+    if (!el) return;
+    _toolCardMap.delete(callId);
     el.classList.add('done');
     const statusText = el.querySelector('.tc-status-text');
     if (statusText) statusText.textContent = '\u00a0已完成';
+
+    let preview = '';
+    let truncated = false;
+    if (typeof output === 'string') {
+      preview = output;
+    } else if (output && typeof output === 'object') {
+      preview = output.preview || JSON.stringify(output, null, 2);
+      truncated = Boolean(output.truncated);
+    }
+
+    if (preview) {
+      const wrap = el.querySelector('.tc-result-wrap');
+      const pre = el.querySelector('.tc-result-pre');
+      if (wrap && pre) {
+        wrap.hidden = false;
+        pre.textContent = truncated ? `${preview}\n\n[结果已截断]` : preview;
+      }
+    }
+  }
+
+  function renderPersistedRow(row) {
+    if (!row || !row.role) return;
+    if (row.role === 'user' || row.role === 'assistant') {
+      appendMessage(row.role, row.content || '');
+      return;
+    }
+    if (row.role === 'tool_call') {
+      try {
+        const payload = JSON.parse(row.content || '{}');
+        const callId = payload.id || `history-${row.id}`;
+        const name = payload.name || 'tool';
+        let args = payload.arguments || {};
+        if (typeof args === 'string') {
+          try {
+            args = JSON.parse(args);
+          } catch (e) {
+            args = { _raw: args };
+          }
+        }
+        appendToolCard(callId, name);
+        finalizeToolInput(callId, args);
+        finalizeToolOutput(callId, {});
+      } catch (e) {
+        appendMessage('assistant', `[工具调用记录] ${row.content || ''}`);
+      }
+    }
   }
 
   function appendMessage(role, text) {
@@ -574,6 +1597,7 @@
 
   function appendTypingIndicator() {
     removeWelcome();
+    removeTypingIndicator();
     const el = document.createElement('div');
     el.className = 'msg assistant';
     el.id = 'typing';
@@ -588,34 +1612,207 @@
   }
 
   function removeTypingIndicator() {
-    document.getElementById('typing')?.remove();
+    document.querySelectorAll('#typing').forEach((el) => el.remove());
   }
 
   function scrollToBottom() {
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
+  function appendLocalInfo(text) {
+    appendMessage('assistant', text);
+  }
+
+  async function handleSlashCommand(rawText) {
+    const [command, ...rest] = rawText.trim().split(/\s+/);
+    const name = command.toLowerCase();
+
+    if (name === '/new' || name === '/clear') {
+      await createAndSwitchSession();
+      return true;
+    }
+
+    if (name === '/sessions') {
+      openSessionDrawer();
+      await refreshSessionList();
+      return true;
+    }
+
+    if (name === '/session') {
+      if (!rest.length) {
+        openSessionDrawer();
+        await refreshSessionList();
+        return true;
+      }
+      const keyword = rest.join(' ').trim().toLowerCase();
+      const sessions = sessionListCache.length ? sessionListCache : await fetchSessions();
+      const matched = sessions.find((session) =>
+        (session.id || '').toLowerCase().startsWith(keyword) ||
+        (session.title || '').toLowerCase().includes(keyword)
+      );
+      if (!matched) {
+        appendLocalInfo(`没有找到会话：${rest.join(' ')}\n输入 /sessions 打开面板手动切换。`);
+        return true;
+      }
+      await switchConversation(matched.id);
+      appendLocalInfo(`已切换到会话：${matched.title || matched.id.slice(0, 8)}`);
+      return true;
+    }
+
+    if (name === '/help') {
+      appendLocalInfo(
+        '可用命令：\n' +
+        '/new 或 /clear：新建会话\n' +
+        '/sessions：打开会话面板\n' +
+        '/session <id前缀/标题关键词>：切换会话\n' +
+        '/thinking：开关 Thinking 折叠块\n' +
+        '/details：开关工具调用卡片\n' +
+        '/help：查看命令帮助'
+      );
+      return true;
+    }
+
+    if (name === '/thinking') {
+      uiPrefs.showThinking = !uiPrefs.showThinking;
+      applyUiPrefs();
+      appendLocalInfo(`Thinking 已${uiPrefs.showThinking ? '开启' : '关闭'}`);
+      return true;
+    }
+
+    if (name === '/details') {
+      uiPrefs.showToolDetails = !uiPrefs.showToolDetails;
+      applyUiPrefs();
+      appendLocalInfo(`工具调用卡片已${uiPrefs.showToolDetails ? '开启' : '关闭'}`);
+      return true;
+    }
+
+    appendLocalInfo(`未识别的命令：${rawText}\n输入 /help 查看可用命令。`);
+    return true;
+  }
+
   // ── 发送消息 ──────────────────────────────────────────────────────────────
-  function sendMessage() {
+  async function sendMessage() {
     const text = inputBox.value.trim();
-    if (!text || isWaiting || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!text) return;
+    hideSlashMenu();
+
+    if (text.startsWith('/')) {
+      inputBox.value = '';
+      autoResize();
+      try {
+        await handleSlashCommand(text);
+      } catch (e) {
+        showError(e?.message || '命令执行失败');
+      }
+      inputBox.focus();
+      return;
+    }
+
+    if (isWaiting || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+    if (!currentConversationId) {
+      try {
+        const created = await createSession();
+        setCurrentSession(created);
+      } catch (e) {
+        showError(e?.message || '创建会话失败');
+        return;
+      }
+    }
 
     appendMessage('user', text);
     inputBox.value = '';
     autoResize();
     appendTypingIndicator();  // 等第一个 token 到来前显示打字动画
 
-    ws.send(text);
+    ws.send(JSON.stringify({
+      type: 'input',
+      conversationId: currentConversationId,
+      text,
+    }));
     isWaiting = true;
     sendBtn.disabled = true;
   }
 
-  sendBtn.addEventListener('click', sendMessage);
+  sendBtn.addEventListener('click', () => {
+    void sendMessage();
+  });
 
   inputBox.addEventListener('keydown', (e) => {
+    if (e.isComposing) return;
+    const slashMenuVisible = slashMenu.classList.contains('show');
+
+    if (slashMenuVisible && e.key === 'ArrowDown') {
+      e.preventDefault();
+      moveSlashMenuSelection(1);
+      return;
+    }
+    if (slashMenuVisible && e.key === 'ArrowUp') {
+      e.preventDefault();
+      moveSlashMenuSelection(-1);
+      return;
+    }
+    if (slashMenuVisible && e.key === 'Tab') {
+      e.preventDefault();
+      applySlashMenuSelection(slashMenuActiveIndex, { execute: false });
+      return;
+    }
+    if (slashMenuVisible && e.key === 'Escape') {
+      e.preventDefault();
+      hideSlashMenu();
+      return;
+    }
+    if (
+      slashMenuVisible &&
+      e.key === 'Enter' &&
+      !e.shiftKey &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      slashMenuItems.length &&
+      inputBox.value.trim().startsWith('/')
+    ) {
+      e.preventDefault();
+      applySlashMenuSelection(slashMenuActiveIndex, { execute: true });
+      return;
+    }
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      void sendMessage();
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      void sendMessage();
+    }
+  });
+
+  sessionsBtn.addEventListener('click', () => {
+    if (isSessionDrawerOpen) {
+      closeSessionDrawer();
+      return;
+    }
+    openSessionDrawer();
+    void refreshSessionList();
+  });
+
+  newSessionBtn.addEventListener('click', () => {
+    void createAndSwitchSession();
+  });
+
+  drawerNewBtn.addEventListener('click', () => {
+    void createAndSwitchSession();
+  });
+
+  refreshSessionsBtn.addEventListener('click', () => {
+    void refreshSessionList();
+  });
+
+  closeDrawerBtn.addEventListener('click', closeSessionDrawer);
+  sessionBackdrop.addEventListener('click', closeSessionDrawer);
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isSessionDrawerOpen) {
+      closeSessionDrawer();
     }
   });
 
@@ -624,7 +1821,15 @@
     inputBox.style.height = 'auto';
     inputBox.style.height = Math.min(inputBox.scrollHeight, 140) + 'px';
   }
-  inputBox.addEventListener('input', autoResize);
+  inputBox.addEventListener('input', () => {
+    autoResize();
+    updateSlashMenu();
+  });
+  inputBox.addEventListener('focus', updateSlashMenu);
+  document.addEventListener('click', (event) => {
+    if (event.target === inputBox || slashMenu.contains(event.target)) return;
+    hideSlashMenu();
+  });
 
   // ── 错误提示 ──────────────────────────────────────────────────────────────
   function showError(msg) {
@@ -646,6 +1851,19 @@
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
   }
+
+  async function boot() {
+    applyUiPrefs();
+    updateSubtitle();
+    connect();
+    try {
+      await ensureSession();
+    } catch (e) {
+      showError(e?.message || '初始化会话失败');
+    }
+  }
+
+  void boot();
 </script>
 </body>
 </html>

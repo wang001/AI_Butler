@@ -8,11 +8,12 @@ tools/file_reader.py — 纯文本文件读取工具
   1. 读取 ToolDispatcher 溢出写入的大结果文件（/data/tool_call/）
   2. 读取工作目录下的配置、日志、数据等文本文件
 
-支持四种读取模式（参数自由组合）：
+支持五种读取模式（参数自由组合）：
   - 全文读取   : 只传 path
   - 行范围读取 : 传 start_line / end_line，适合已知结构的大文件分段读取
   - 关键词过滤 : 传 pattern（正则），只返回匹配行
   - 搜索+上下文: pattern + context_lines，类似 grep -C
+  - 字符截断   : 传 max_chars，对最终返回文本做字符数上限控制
 
 注意：此工具的返回结果不受大小限制写入临时文件，自身有 _MAX_LINES 行数兜底。
 """
@@ -48,7 +49,8 @@ FILE_READER_TOOLS: list[dict] = [
                 "  1. 全文读取：只传 path\n"
                 "  2. 行范围：传 start_line / end_line 读取指定行区间\n"
                 "  3. 关键词过滤：传 pattern（正则），只返回匹配行\n"
-                "  4. 搜索+上下文：pattern + context_lines，看匹配行的前后几行\n\n"
+                "  4. 搜索+上下文：pattern + context_lines，看匹配行的前后几行\n"
+                "  5. 字符截断：传 max_chars，对最终输出做字符上限控制\n\n"
                 "典型用法：\n"
                 "  - 工具结果过长被写入文件后，用此工具按需读取\n"
                 "  - 读取工作目录下的配置、日志、数据文件"
@@ -88,6 +90,15 @@ FILE_READER_TOOLS: list[dict] = [
                         "description": "文件编码，默认 utf-8",
                         "default": "utf-8",
                     },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": (
+                            "最终返回文本的最大字符数。"
+                            "适合在已知文件较大时先做粗截断，默认不限制。"
+                        ),
+                        "minimum": 200,
+                        "maximum": 50000,
+                    },
                 },
                 "required": ["path"],
             },
@@ -108,6 +119,7 @@ def read_file(
     pattern: Optional[str] = None,
     context_lines: int = 0,
     encoding: str = "utf-8",
+    max_chars: Optional[int] = None,
 ) -> str:
     """
     读取文件内容，返回字符串结果。
@@ -119,6 +131,7 @@ def read_file(
         pattern       : 正则过滤，只返回匹配行（及 context_lines 行上下文）
         context_lines : pattern 匹配时，前后各保留的行数
         encoding      : 文件编码，默认 utf-8
+        max_chars     : 最终返回文本最大字符数，None 表示不限制
 
     Returns:
         文件内容字符串，包含行号前缀，格式：
@@ -208,4 +221,18 @@ def read_file(
         header_parts.append(f"⚠ 结果超过 {_MAX_LINES} 行，已截断，请缩小范围或使用 pattern 过滤")
 
     header = "  |  ".join(header_parts)
-    return f"[{header}]\n{output}"
+    result = f"[{header}]\n{output}"
+
+    if max_chars is not None:
+        max_chars = max(200, min(max_chars, 50000))
+        if len(result) > max_chars:
+            note = f"\n\n[read_file] 已按 max_chars={max_chars} 截断输出，请缩小范围或使用 pattern 过滤。"
+            header_text = f"[{header}]"
+            body_budget = max_chars - len(header_text) - len(note) - 1
+            if body_budget > 0:
+                body = output[:body_budget].rstrip()
+                result = f"{header_text}\n{body}{note}"
+            else:
+                result = f"{header_text}{note}"
+
+    return result

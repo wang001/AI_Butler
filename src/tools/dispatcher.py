@@ -7,7 +7,8 @@ Tool Call 调度器
 
 工具实现分布：
   - memory.py      : search_memory, search_history（记忆 / 历史检索）
-  - search.py      : web_search（多平台聚合网络搜索）
+  - search.py      : web_search（搜索结果页检索）
+  - web_fetcher.py : web_fetcher（已知 URL 的正文抓取）
   - file_reader.py : read_file（纯文本文件读取）
   - command.py     : run_command（Docker 容器内 shell 命令执行，COMMAND_ENABLED 控制）
   - browser.py     : browser_use（AI 驱动的浏览器自动化，BROWSER_ENABLED 控制）
@@ -21,14 +22,16 @@ Tool Call 调度器
   工具返回结果超过字符上限时，将完整内容写入 tool_call_dir/<工具名>_<时间戳>.txt，
   并返回文件路径提示，让模型通过 read_file 工具按需读取，避免截断导致信息丢失。
 """
+import inspect
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from tools.memory import MEMORY_TOOLS, MemoryTools
 from tools.search import SEARCH_TOOLS, web_search
 from tools.file_reader import FILE_READER_TOOLS, read_file as _read_file
+from tools.web_fetcher import WEB_FETCHER_TOOLS, web_fetcher
 from tools.command import COMMAND_TOOLS
 from tools.browser import BROWSER_TOOLS
 
@@ -68,6 +71,7 @@ TOOL_CONCURRENT_SAFE: dict[str, bool] = {
     "update_memory":    False,  # 写 MEMORY.md，必须串行独占
     "get_current_time": True,   # 纯计算，无 IO
     "web_search":       True,   # 只读：外部搜索引擎
+    "web_fetcher":      True,   # 只读：网页正文抓取
     "read_file":        True,   # 只读：本地文件读取
     "run_command":      False,  # 可能写文件、修改系统状态
     "browser_use":      False,  # 共享浏览器实例，有状态操作
@@ -119,6 +123,7 @@ class ToolDispatcher:
         self.tools: list[dict] = (
             (memory_tools if memory_tools is not None else MEMORY_TOOLS)
             + SEARCH_TOOLS
+            + WEB_FETCHER_TOOLS
             + FILE_READER_TOOLS
             + _TIME_TOOLS
             + (COMMAND_TOOLS if command_executor is not None else [])
@@ -156,6 +161,107 @@ class ToolDispatcher:
             return result
         return self._spill_to_file(tool_name, result)
 
+    def _describe_tool_signature(
+        self,
+        handler: Callable[..., Any],
+    ) -> tuple[list[str], list[str], bool]:
+        """
+        返回 (allowed_names, required_names, accepts_var_keyword)。
+
+        用于在真正调用工具前给出可恢复的参数错误，而不是直接抛 TypeError 中断整轮 agent。
+        """
+        signature = inspect.signature(handler)
+        allowed_names: list[str] = []
+        required_names: list[str] = []
+        accepts_var_keyword = False
+
+        for name, param in signature.parameters.items():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                accepts_var_keyword = True
+                continue
+            if param.kind not in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                continue
+            allowed_names.append(name)
+            if param.default is inspect.Signature.empty:
+                required_names.append(name)
+
+        return allowed_names, required_names, accepts_var_keyword
+
+    def _format_tool_arg_error(
+        self,
+        tool_name: str,
+        message: str,
+        allowed_names: list[str],
+        required_names: list[str],
+    ) -> str:
+        parts = [f"[{tool_name} 参数错误] {message}"]
+        if allowed_names:
+            parts.append("允许参数：" + ", ".join(allowed_names))
+        if required_names:
+            parts.append("必填参数：" + ", ".join(required_names))
+        parts.append("请根据工具 schema 修正参数后重试。")
+        return "\n".join(parts)
+
+    async def _call_tool(
+        self,
+        tool_name: str,
+        handler: Callable[..., Any],
+        args: dict[str, Any],
+        allow_spill: bool = True,
+    ) -> str:
+        """
+        通用工具调用包装：
+          - 预校验参数名 / 必填参数
+          - 捕获 TypeError 等可恢复错误并转成 tool_result 文本
+          - 避免单个工具调用直接炸掉整轮推理
+        """
+        allowed_names, required_names, accepts_var_keyword = (
+            self._describe_tool_signature(handler)
+        )
+
+        if not accepts_var_keyword:
+            unexpected = sorted(set(args) - set(allowed_names))
+            if unexpected:
+                return self._format_tool_arg_error(
+                    tool_name=tool_name,
+                    message="不支持参数: " + ", ".join(unexpected),
+                    allowed_names=allowed_names,
+                    required_names=required_names,
+                )
+
+        missing = [name for name in required_names if name not in args]
+        if missing:
+            return self._format_tool_arg_error(
+                tool_name=tool_name,
+                message="缺少必填参数: " + ", ".join(missing),
+                allowed_names=allowed_names,
+                required_names=required_names,
+            )
+
+        try:
+            result = handler(**args)
+            if inspect.isawaitable(result):
+                result = await result
+        except TypeError as exc:
+            return self._format_tool_arg_error(
+                tool_name=tool_name,
+                message=str(exc),
+                allowed_names=allowed_names,
+                required_names=required_names,
+            )
+        except Exception as exc:
+            return f"[{tool_name} 失败] {exc}"
+
+        if not isinstance(result, str):
+            result = json.dumps(result, ensure_ascii=False, indent=2)
+
+        if not allow_spill:
+            return result
+        return self._handle_result(tool_name, result)
+
     async def run(self, name: str, arguments: str) -> str:
         """
         按工具名称分发执行，返回字符串结果（回传给 LLM 作为 tool_result）。
@@ -167,27 +273,27 @@ class ToolDispatcher:
             args = {}
 
         if name == "search_memory":
-            result = await self.memory.search_memory(**args)
+            return await self._call_tool(name, self.memory.search_memory, args)
         elif name == "search_history":
-            result = self.memory.search_history(**args)
+            return await self._call_tool(name, self.memory.search_history, args)
         elif name == "update_memory":
-            result = await self.memory.update_memory(**args)
+            return await self._call_tool(name, self.memory.update_memory, args)
         elif name == "get_current_time":
-            result = self._get_current_time(**args)
+            return await self._call_tool(name, self._get_current_time, args)
         elif name == "web_search":
-            result = await web_search(**args)
+            return await self._call_tool(name, web_search, args)
+        elif name == "web_fetcher":
+            return await self._call_tool(name, web_fetcher, args)
         elif name == "read_file":
             # 同步调用；自身有 _MAX_LINES 行数兜底，且结果不能再写入文件（会死循环），
             # 必须直接 return，绕过 _handle_result / _spill_to_file。
-            return _read_file(**args)
+            return await self._call_tool(name, _read_file, args, allow_spill=False)
         elif name == "run_command":
-            result = await self._run_command(**args)
+            return await self._call_tool(name, self._run_command, args)
         elif name == "browser_use":
-            result = await self._browser_use(**args)
+            return await self._call_tool(name, self._browser_use, args)
         else:
-            result = f"[未知工具: {name}]"
-
-        return self._handle_result(name, result)
+            return f"[未知工具: {name}]"
 
     # ── 内联工具实现（仅 get_current_time，其余见各自模块） ────────────────────
 

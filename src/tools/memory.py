@@ -213,4 +213,5 @@ class MemoryTools:
         return await self.memory_update_service.request_update(
             trigger="tool",
             proposed_notes=notes,
+            force=True,
         )

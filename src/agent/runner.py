@@ -24,9 +24,11 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import AsyncGenerator, TYPE_CHECKING
+import uuid
+from typing import Any, AsyncGenerator, TYPE_CHECKING
 
 from openai import AsyncOpenAI
+from agent.stream_events import StreamEvent
 
 if TYPE_CHECKING:
     from agent.hooks import AgentHook
@@ -43,8 +45,17 @@ _TOOL_SECTION_RE = re.compile(
     r"<\|tool_calls_section_begin\|>.*?<\|tool_calls_section_end\|>",
     re.DOTALL,
 )
-_TOOL_SECTION_OPEN  = "<|tool_calls_section_begin|>"
+_MINIMAX_TOOL_CALL_RE = re.compile(
+    r"<minimax:tool_call>.*?</minimax:tool_call>",
+    re.DOTALL,
+)
+_TOOL_SECTION_OPEN = "<|tool_calls_section_begin|>"
 _TOOL_SECTION_CLOSE = "<|tool_calls_section_end|>"
+_MINIMAX_TOOL_CALL_OPEN = "<minimax:tool_call>"
+_MINIMAX_TOOL_CALL_CLOSE = "</minimax:tool_call>"
+_THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
 
 
 def _strip_tool_markup(text: str) -> str:
@@ -53,55 +64,313 @@ def _strip_tool_markup(text: str) -> str:
     同时去掉段落前后多余的空白行。
     """
     if not text or _TOOL_SECTION_OPEN not in text:
-        return text
-    cleaned = _TOOL_SECTION_RE.sub("", text)
+        cleaned = text
+    else:
+        cleaned = _TOOL_SECTION_RE.sub("", text)
+    cleaned = _MINIMAX_TOOL_CALL_RE.sub("", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
 
-async def _strip_tool_sections_stream(
-    gen: AsyncGenerator[str, None],
-) -> AsyncGenerator[str, None]:
+class _ToolMarkupFilter:
     """
-    从流式 token 序列中过滤 <|tool_calls_section_begin|>...<|tool_calls_section_end|>。
+    逐 chunk 过滤模型输出中的 tool_calls_section 标记。
 
-    采用滑动缓冲区方案：
-    - NORMAL 模式：安全部分立即 yield，末尾保留足够字符以检测开始标记。
-    - SUPPRESS 模式：丢弃所有内容直到找到结束标记。
+    这样我们既能在同一条流里处理 content delta，又能保留 reasoning delta 的原始顺序。
     """
-    OPEN  = _TOOL_SECTION_OPEN
-    CLOSE = _TOOL_SECTION_CLOSE
-    KEEP  = max(len(OPEN), len(CLOSE)) - 1
 
-    buf         = ""
-    suppressing = False
+    def __init__(self) -> None:
+        self._keep = max(len(_TOOL_SECTION_OPEN), len(_TOOL_SECTION_CLOSE)) - 1
+        self._buf = ""
+        self._suppressing = False
 
-    async for token in gen:
-        buf += token
+    def feed(self, chunk: str) -> list[str]:
+        self._buf += chunk
+        out: list[str] = []
 
         while True:
-            if suppressing:
-                idx = buf.find(CLOSE)
+            if self._suppressing:
+                idx = self._buf.find(_TOOL_SECTION_CLOSE)
                 if idx == -1:
-                    buf = buf[-KEEP:] if len(buf) > KEEP else buf
+                    self._buf = self._buf[-self._keep:] if len(self._buf) > self._keep else self._buf
                     break
-                buf        = buf[idx + len(CLOSE):]
-                suppressing = False
-            else:
-                idx = buf.find(OPEN)
-                if idx == -1:
-                    if len(buf) > KEEP:
-                        yield buf[:-KEEP]
-                        buf = buf[-KEEP:]
-                    break
-                prefix = buf[:idx].rstrip()
-                if prefix:
-                    yield prefix
-                buf        = buf[idx + len(OPEN):]
-                suppressing = True
+                self._buf = self._buf[idx + len(_TOOL_SECTION_CLOSE):]
+                self._suppressing = False
+                continue
 
-    if buf and not suppressing:
-        yield buf
+            idx = self._buf.find(_TOOL_SECTION_OPEN)
+            if idx == -1:
+                if len(self._buf) > self._keep:
+                    out.append(self._buf[:-self._keep])
+                    self._buf = self._buf[-self._keep:]
+                break
+
+            prefix = self._buf[:idx].rstrip()
+            if prefix:
+                out.append(prefix)
+            self._buf = self._buf[idx + len(_TOOL_SECTION_OPEN):]
+            self._suppressing = True
+
+        return out
+
+    def flush(self) -> list[str]:
+        if self._buf and not self._suppressing:
+            out = [self._buf]
+        else:
+            out = []
+        self._buf = ""
+        self._suppressing = False
+        return out
+
+
+class _ContentBlockFilter:
+    """
+    逐 chunk 拆分 content：
+      - tool_calls_section 直接抑制
+      - <think>...</think> 输出为 reasoning 片段
+      - 其余内容输出为 text 片段
+
+    这样即便 provider 只会在 content 里塞 think 标签，我们也能转成结构化事件。
+    """
+
+    def __init__(self) -> None:
+        self._keep = max(
+            len(_TOOL_SECTION_OPEN),
+            len(_TOOL_SECTION_CLOSE),
+            len(_MINIMAX_TOOL_CALL_OPEN),
+            len(_MINIMAX_TOOL_CALL_CLOSE),
+            len(_THINK_OPEN),
+            len(_THINK_CLOSE),
+        ) - 1
+        self._buf = ""
+        self._mode = "text"
+
+    def _emit_partial(self, kind: str) -> list[tuple[str, str]]:
+        if len(self._buf) <= self._keep:
+            return []
+        piece = self._buf[:-self._keep]
+        self._buf = self._buf[-self._keep:]
+        return [(kind, piece)] if piece else []
+
+    def feed(self, chunk: str) -> list[tuple[str, str]]:
+        self._buf += chunk
+        out: list[tuple[str, str]] = []
+
+        while True:
+            if self._mode == "tool":
+                close_candidates = [
+                    idx for idx in (
+                        self._buf.find(_TOOL_SECTION_CLOSE),
+                        self._buf.find(_MINIMAX_TOOL_CALL_CLOSE),
+                    )
+                    if idx != -1
+                ]
+                if not close_candidates:
+                    if len(self._buf) > self._keep:
+                        self._buf = self._buf[-self._keep:]
+                    break
+                idx = min(close_candidates)
+                close_marker = (
+                    _TOOL_SECTION_CLOSE
+                    if idx == self._buf.find(_TOOL_SECTION_CLOSE)
+                    else _MINIMAX_TOOL_CALL_CLOSE
+                )
+                self._buf = self._buf[idx + len(close_marker):]
+                self._mode = "text"
+                continue
+
+            if self._mode == "reasoning":
+                idx = self._buf.find(_THINK_CLOSE)
+                if idx == -1:
+                    out.extend(self._emit_partial("reasoning"))
+                    break
+                piece = self._buf[:idx]
+                if piece:
+                    out.append(("reasoning", piece))
+                self._buf = self._buf[idx + len(_THINK_CLOSE):]
+                self._mode = "text"
+                continue
+
+            candidates = [
+                (self._buf.find(_THINK_OPEN), "reasoning", len(_THINK_OPEN)),
+                (self._buf.find(_TOOL_SECTION_OPEN), "tool", len(_TOOL_SECTION_OPEN)),
+                (
+                    self._buf.find(_MINIMAX_TOOL_CALL_OPEN),
+                    "tool",
+                    len(_MINIMAX_TOOL_CALL_OPEN),
+                ),
+            ]
+            candidates = [item for item in candidates if item[0] != -1]
+            if not candidates:
+                out.extend(self._emit_partial("text"))
+                break
+
+            idx, next_mode, marker_len = min(candidates, key=lambda item: item[0])
+            piece = self._buf[:idx]
+            if piece:
+                out.append(("text", piece))
+            self._buf = self._buf[idx + marker_len:]
+            self._mode = next_mode
+
+        return out
+
+    def flush(self) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        if self._buf and self._mode != "tool":
+            kind = "reasoning" if self._mode == "reasoning" else "text"
+            out.append((kind, self._buf))
+        self._buf = ""
+        self._mode = "text"
+        return out
+
+
+def _textify(value: Any) -> str:
+    """将 provider 特有的 delta 结构尽量规整成字符串。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(_textify(item) for item in value)
+    if isinstance(value, dict):
+        for key in ("text", "content", "value"):
+            if key in value and value[key] is not None:
+                return _textify(value[key])
+        return ""
+
+    for key in ("text", "content", "value"):
+        attr = getattr(value, key, None)
+        if attr is not None:
+            return _textify(attr)
+    return ""
+
+
+def _extract_reasoning_text(delta: Any) -> str:
+    """兼容 OpenAI 兼容接口里常见的 reasoning delta 字段。"""
+    for key in ("reasoning_content", "reasoning"):
+        text = _textify(getattr(delta, key, None))
+        if text:
+            return text
+
+    extra = getattr(delta, "model_extra", None) or {}
+    for key in ("reasoning_content", "reasoning"):
+        text = _textify(extra.get(key))
+        if text:
+            return text
+
+    return ""
+
+
+def _extract_content_text(delta: Any) -> str:
+    return _textify(getattr(delta, "content", None))
+
+
+def _new_event_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _split_reasoning_and_reply(text: str) -> tuple[str, str]:
+    """
+    将普通文本拆成 reasoning 与最终展示文本。
+
+    兼容只会输出 <think>...</think> 的 provider，同时剥离工具标记段。
+    """
+    cleaned = _strip_tool_markup(text or "")
+    if not cleaned:
+        return "", ""
+
+    reasoning_parts: list[str] = []
+
+    def _collect(match: re.Match[str]) -> str:
+        block = (match.group(1) or "").strip()
+        if block:
+            reasoning_parts.append(block)
+        return ""
+
+    reply = _THINK_BLOCK_RE.sub(_collect, cleaned)
+    reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
+    reasoning = "\n\n".join(reasoning_parts).strip()
+    return reasoning, reply
+
+
+def _tool_result_preview(result: str, limit: int = 1200) -> tuple[str, bool]:
+    if len(result) <= limit:
+        return result, False
+    return result[:limit].rstrip() + "\n...", True
+
+
+def _tool_output_payload(result: str) -> dict[str, Any]:
+    preview, truncated = _tool_result_preview(result)
+    return {
+        "preview": preview,
+        "truncated": truncated,
+    }
+
+
+def _tool_input_text(args: Any) -> str:
+    if not args:
+        return "{}"
+    return json.dumps(args, ensure_ascii=False, indent=2)
+
+
+def _provider_rejects_system_role(base_url: str, model: str) -> bool:
+    """
+    某些 OpenAI 兼容接口不接受 system role，例如当前接入的 MiniMax 兼容层。
+    """
+    base = (base_url or "").lower()
+    mdl = (model or "").lower()
+    return (
+        "minimax" in base
+        or "minnimax" in base
+        or mdl.startswith("minimax")
+    )
+
+
+def _rewrite_messages_without_system(messages: list[dict]) -> list[dict]:
+    """
+    将 system 消息折叠进第一条 user 消息，兼容不支持 system role 的 provider。
+    """
+    system_chunks: list[str] = []
+    rewritten: list[dict] = []
+
+    for msg in messages:
+        role = msg.get("role", "")
+        if role == "system":
+            content = (msg.get("content") or "").strip()
+            if content:
+                system_chunks.append(content)
+            continue
+        rewritten.append(dict(msg))
+
+    if not system_chunks:
+        return rewritten
+
+    preamble = (
+        "[以下内容是系统指令、长期记忆和检索上下文，请严格遵守，不要把它们当作用户原话复述]\n\n"
+        + "\n\n---\n\n".join(system_chunks)
+    )
+
+    for msg in rewritten:
+        if msg.get("role") == "user":
+            user_content = msg.get("content") or ""
+            msg["content"] = f"{preamble}\n\n---\n\n{user_content}".strip()
+            return rewritten
+
+    return [{"role": "user", "content": preamble}] + rewritten
+
+
+def _prepare_messages_for_llm(
+    llm: AsyncOpenAI,
+    model: str,
+    messages: list[dict],
+) -> list[dict]:
+    """
+    在发给 provider 前做兼容性适配，避免不同兼容层的协议差异直接炸请求。
+    """
+    base_url = str(getattr(llm, "base_url", "") or "")
+    if _provider_rejects_system_role(base_url, model):
+        return _rewrite_messages_without_system(messages)
+    return messages
 
 
 # ── LLM 调用（带限流重试）────────────────────────────────────────────────────
@@ -109,6 +378,12 @@ async def _strip_tool_sections_stream(
 async def _llm_call(llm: AsyncOpenAI, **kwargs):
     """指数退避重试，处理 429 限流。最多 3 次，间隔 2→4→8s。"""
     from openai import RateLimitError
+    if "messages" in kwargs and "model" in kwargs:
+        kwargs["messages"] = _prepare_messages_for_llm(
+            llm=llm,
+            model=kwargs["model"],
+            messages=kwargs["messages"],
+        )
     wait = 2
     for attempt in range(3):
         try:
@@ -148,9 +423,29 @@ class AgentRunner:
     def dispatcher(self) -> "ToolDispatcher":
         return self._dispatcher
 
-    async def _run_tool_batch(self, tool_calls: list) -> list[dict]:
+    async def _execute_tool_call(self, tc) -> tuple[str, str, str]:
+        name = tc.function.name
+        try:
+            args = json.loads(tc.function.arguments or "{}")
+        except Exception:
+            args = {}
+
+        if self._hook:
+            await self._hook.on_tool_start(name, args)
+
+        try:
+            result = await self._dispatcher.run(name, tc.function.arguments)
+        except Exception as exc:
+            result = f"[工具执行失败] {name}: {exc}"
+
+        if self._hook:
+            await self._hook.on_tool_end(name, result)
+
+        return tc.id, name, result
+
+    async def _run_tool_batch(self, tool_calls: list) -> list[tuple[str, str, str]]:
         """
-        执行一批工具调用（批内按并发安全性分组并行），返回 tool role 消息列表。
+        执行一批工具调用（批内按并发安全性分组并行），返回 (tool_call_id, name, result)。
         """
         from tools import TOOL_CONCURRENT_SAFE
 
@@ -165,33 +460,16 @@ class AgentRunner:
             else:
                 batches.append([tc])
 
-        async def _exec(tc):
-            name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except Exception:
-                args = {}
-
-            if self._hook:
-                await self._hook.on_tool_start(name, args)
-
-            result = await self._dispatcher.run(name, tc.function.arguments)
-
-            if self._hook:
-                await self._hook.on_tool_end(name, result)
-
-            return tc.id, result
-
-        tool_messages: list[dict] = []
+        completed: list[tuple[str, str, str]] = []
         for batch in batches:
             if len(batch) == 1:
-                tid, result = await _exec(batch[0])
-                tool_messages.append({"role": "tool", "tool_call_id": tid, "content": result})
+                completed.append(await self._execute_tool_call(batch[0]))
             else:
-                for tid, result in await asyncio.gather(*[_exec(tc) for tc in batch]):
-                    tool_messages.append({"role": "tool", "tool_call_id": tid, "content": result})
+                completed.extend(await asyncio.gather(*[
+                    self._execute_tool_call(tc) for tc in batch
+                ]))
 
-        return tool_messages
+        return completed
 
     async def run(
         self,
@@ -224,14 +502,15 @@ class AgentRunner:
             msg = response.choices[0].message
 
             if not msg.tool_calls:
-                reply = _strip_tool_markup(msg.content or "")
+                _reasoning, reply = _split_reasoning_and_reply(msg.content or "")
                 new_messages.append({"role": "assistant", "content": reply})
                 return reply, new_messages
 
             # 记录 tool_call 消息
+            _reasoning, content = _split_reasoning_and_reply(msg.content or "")
             new_messages.append({
                 "role": "assistant",
-                "content": _strip_tool_markup(msg.content or "") or None,
+                "content": content or None,
                 "tool_calls": [
                     {
                         "id": tc.id,
@@ -242,7 +521,8 @@ class AgentRunner:
                 ],
             })
 
-            new_messages.extend(await self._run_tool_batch(msg.tool_calls))
+            for tid, _name, result in await self._run_tool_batch(msg.tool_calls):
+                new_messages.append({"role": "tool", "tool_call_id": tid, "content": result})
 
         # 超过最大轮次，强制不带工具再请求
         response = await _llm_call(
@@ -251,30 +531,32 @@ class AgentRunner:
             messages=messages + new_messages,
             stream=False,
         )
-        reply = _strip_tool_markup(response.choices[0].message.content or "")
+        _reasoning, reply = _split_reasoning_and_reply(
+            response.choices[0].message.content or ""
+        )
         new_messages.append({"role": "assistant", "content": reply})
         return reply, new_messages
 
     async def run_stream(
         self,
         messages: list[dict],
-    ) -> AsyncGenerator[str | list[dict], None]:
+    ) -> AsyncGenerator[StreamEvent | list[dict], None]:
         """
         Tool Call 循环（流式版本）。
 
         yield 三类内容：
-          - str（以 \\x00TOOL_CALL: 开头）  工具开始调用事件
-          - str（以 \\x00TOOL_RESULT: 开头）工具执行完毕事件
-          - str（普通字符串）               最终回复的 token
-          - list[dict]（最后一次）          new_messages，供 Butler 做持久化
+          - StreamEvent                        流式结构化事件
+          - list[dict]（最后一次）            new_messages，供 Butler 做持久化
 
         工具调用阶段：非流式等待工具完成。
-        最终回复阶段：stream=True，逐 token yield。
+        最终回复阶段：stream=True，逐 delta yield。
         超过 MAX_TOOL_ROUNDS 后强制以流式输出最终回复（不带 tools）。
         """
         new_messages: list[dict] = []
 
         for _ in range(MAX_TOOL_ROUNDS):
+            yield {"type": "start-step"}
+
             # 先非流式探测是否有 tool_calls
             if self._hook:
                 await self._hook.on_llm_start(messages + new_messages)
@@ -294,23 +576,24 @@ class AgentRunner:
             msg = response.choices[0].message
 
             if not msg.tool_calls:
-                # 没有工具调用 → 以流式重新请求并 yield tokens
-                reply_tokens: list[str] = []
-                async for token in _strip_tool_sections_stream(
-                    self._stream_reply(messages + new_messages)
-                ):
-                    reply_tokens.append(token)
-                    if self._hook:
-                        await self._hook.on_stream_token(token)
-                    yield token
-                new_messages.append({"role": "assistant", "content": "".join(reply_tokens)})
+                # 没有工具调用 → 以流式重新请求并 yield 结构化事件
+                reply_parts: list[str] = []
+                async for event in self._stream_reply(messages + new_messages):
+                    if event["type"] == "text-delta":
+                        reply_parts.append(event["delta"])
+                        if self._hook:
+                            await self._hook.on_stream_token(event["delta"])
+                    yield event
+                yield {"type": "finish-step", "finishReason": "stop"}
+                new_messages.append({"role": "assistant", "content": "".join(reply_parts)})
                 yield new_messages
                 return
 
             # 有 tool_calls → 记录 & 通知 & 执行
+            reasoning, content = _split_reasoning_and_reply(msg.content or "")
             new_messages.append({
                 "role": "assistant",
-                "content": _strip_tool_markup(msg.content or "") or None,
+                "content": content or None,
                 "tool_calls": [
                     {
                         "id": tc.id,
@@ -321,48 +604,74 @@ class AgentRunner:
                 ],
             })
 
+            display_reasoning = "\n\n".join(part for part in (reasoning, content or "") if part).strip()
+            if display_reasoning:
+                reasoning_id = _new_event_id("reasoning")
+                yield {"type": "reasoning-start", "id": reasoning_id}
+                yield {
+                    "type": "reasoning-delta",
+                    "id": reasoning_id,
+                    "delta": display_reasoning,
+                }
+                yield {"type": "reasoning-end", "id": reasoning_id}
+
             for tc in msg.tool_calls:
-                name = tc.function.name
                 try:
                     args = json.loads(tc.function.arguments or "{}")
                 except Exception:
                     args = {"_raw": tc.function.arguments}
-                payload = json.dumps({"name": name, "args": args}, ensure_ascii=False)
-                yield f"\x00TOOL_CALL:{payload}"
+                yield {"type": "tool-input-start", "toolCallId": tc.id, "toolName": tc.function.name}
+                yield {
+                    "type": "tool-input-delta",
+                    "toolCallId": tc.id,
+                    "inputTextDelta": _tool_input_text(args),
+                }
+                yield {
+                    "type": "tool-input-available",
+                    "toolCallId": tc.id,
+                    "toolName": tc.function.name,
+                    "input": args,
+                }
 
             # 执行工具
-            tool_messages = await self._run_tool_batch(msg.tool_calls)
-            new_messages.extend(tool_messages)
-
-            tool_names = [tc.function.name for tc in msg.tool_calls]
-            for name in tool_names:
-                payload = json.dumps({"name": name}, ensure_ascii=False)
-                yield f"\x00TOOL_RESULT:{payload}"
+            for tid, _name, result in await self._run_tool_batch(msg.tool_calls):
+                new_messages.append({"role": "tool", "tool_call_id": tid, "content": result})
+                yield {
+                    "type": "tool-output-available",
+                    "toolCallId": tid,
+                    "output": _tool_output_payload(result),
+                }
+            yield {"type": "finish-step", "finishReason": "tool-calls"}
 
         # 超过最大轮次，强制流式输出（不带 tools）
-        reply_tokens: list[str] = []
-        async for token in _strip_tool_sections_stream(
-            self._stream_reply(messages + new_messages, use_tools=False)
-        ):
-            reply_tokens.append(token)
-            if self._hook:
-                await self._hook.on_stream_token(token)
-            yield token
-        new_messages.append({"role": "assistant", "content": "".join(reply_tokens)})
+        yield {"type": "start-step"}
+        reply_parts: list[str] = []
+        async for event in self._stream_reply(messages + new_messages, use_tools=False):
+            if event["type"] == "text-delta":
+                reply_parts.append(event["delta"])
+                if self._hook:
+                    await self._hook.on_stream_token(event["delta"])
+            yield event
+        yield {"type": "finish-step", "finishReason": "stop"}
+        new_messages.append({"role": "assistant", "content": "".join(reply_parts)})
         yield new_messages
 
     async def _stream_reply(
         self,
         messages: list[dict],
         use_tools: bool = False,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[StreamEvent, None]:
         """
-        以 stream=True 请求 LLM，逐 token yield 文本片段。
+        以 stream=True 请求 LLM，逐 delta yield 结构化事件。
         """
         from openai import RateLimitError
         kwargs = dict(
             model=self._model,
-            messages=messages,
+            messages=_prepare_messages_for_llm(
+                llm=self._llm,
+                model=self._model,
+                messages=messages,
+            ),
             stream=True,
         )
         if use_tools:
@@ -380,7 +689,91 @@ class AgentRunner:
                 await asyncio.sleep(wait)
                 wait = min(wait * 2, 32)
 
+        content_filter = _ContentBlockFilter()
+        active_reasoning_id: str | None = None
+        active_text_id: str | None = None
+
+        async def _close_text_if_needed() -> AsyncGenerator[StreamEvent, None]:
+            nonlocal active_text_id
+            if active_text_id is not None:
+                yield {"type": "text-end", "id": active_text_id}
+                active_text_id = None
+
+        async def _close_reasoning_if_needed() -> AsyncGenerator[StreamEvent, None]:
+            nonlocal active_reasoning_id
+            if active_reasoning_id is not None:
+                yield {"type": "reasoning-end", "id": active_reasoning_id}
+                active_reasoning_id = None
+
         async for chunk in stream:
             delta = chunk.choices[0].delta if chunk.choices else None
-            if delta and delta.content:
-                yield delta.content
+            if not delta:
+                continue
+
+            reasoning_text = _extract_reasoning_text(delta)
+            if reasoning_text:
+                async for event in _close_text_if_needed():
+                    yield event
+                if active_reasoning_id is None:
+                    active_reasoning_id = _new_event_id("reasoning")
+                    yield {"type": "reasoning-start", "id": active_reasoning_id}
+                yield {
+                    "type": "reasoning-delta",
+                    "id": active_reasoning_id,
+                    "delta": reasoning_text,
+                }
+
+            content_text = _extract_content_text(delta)
+            if not content_text:
+                continue
+
+            for kind, piece in content_filter.feed(content_text):
+                if not piece:
+                    continue
+                if kind == "reasoning":
+                    async for event in _close_text_if_needed():
+                        yield event
+                    if active_reasoning_id is None:
+                        active_reasoning_id = _new_event_id("reasoning")
+                        yield {"type": "reasoning-start", "id": active_reasoning_id}
+                    yield {
+                        "type": "reasoning-delta",
+                        "id": active_reasoning_id,
+                        "delta": piece,
+                    }
+                    continue
+
+                async for event in _close_reasoning_if_needed():
+                    yield event
+                if active_text_id is None:
+                    active_text_id = _new_event_id("text")
+                    yield {"type": "text-start", "id": active_text_id}
+                yield {"type": "text-delta", "id": active_text_id, "delta": piece}
+
+        for kind, piece in content_filter.flush():
+            if not piece:
+                continue
+            if kind == "reasoning":
+                async for event in _close_text_if_needed():
+                    yield event
+                if active_reasoning_id is None:
+                    active_reasoning_id = _new_event_id("reasoning")
+                    yield {"type": "reasoning-start", "id": active_reasoning_id}
+                yield {
+                    "type": "reasoning-delta",
+                    "id": active_reasoning_id,
+                    "delta": piece,
+                }
+                continue
+
+            async for event in _close_reasoning_if_needed():
+                yield event
+            if active_text_id is None:
+                active_text_id = _new_event_id("text")
+                yield {"type": "text-start", "id": active_text_id}
+            yield {"type": "text-delta", "id": active_text_id, "delta": piece}
+
+        async for event in _close_reasoning_if_needed():
+            yield event
+        async for event in _close_text_if_needed():
+            yield event

@@ -5,6 +5,7 @@ tools — AI Butler 工具层
   - dispatcher.py  : Tool Call 调度器（按名称分发 + 结果溢出写文件）
   - memory.py      : 记忆工具（search_memory / search_history）
   - search.py      : 网络搜索（web_search）
+  - web_fetcher.py : 网页正文抓取（web_fetcher）
   - file_reader.py : 纯文本文件读取（read_file）
   - command.py     : Docker 容器内 shell 命令执行（run_command）
   - browser.py     : 浏览器自动化（browser_use）

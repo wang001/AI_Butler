@@ -26,8 +26,8 @@ class CliHook(AgentHook):
     """
     CLI 专用 AgentHook。
 
-    在工具调用期间暂停 spinner 并打印进度行。
-    spinner 引用由 run() 主循环在每轮对话开始时注入。
+    仅维护 spinner 生命周期。
+    CLI 不再展示工具过程，只显示最终回复文本。
     """
 
     def __init__(self):
@@ -39,19 +39,10 @@ class CliHook(AgentHook):
             self._spinner = spinner
 
     async def on_tool_start(self, name: str, args: dict) -> None:
-        with self._spinner_lock:
-            spinner = self._spinner
-        if spinner:
-            with spinner.pause():
-                safe_print(f"\n[工具调用] {name}")
+        return None
 
     async def on_tool_end(self, name: str, result: str) -> None:
-        with self._spinner_lock:
-            spinner = self._spinner
-        if spinner:
-            with spinner.pause():
-                preview = result[:200] + ("..." if len(result) > 200 else "")
-                safe_print(f"[工具结果:{name}] {preview}")
+        return None
 
 
 async def run(
@@ -99,13 +90,10 @@ async def run(
                         sp = ThinkingSpinner()
                         sp.__enter__()
                         hook.set_spinner(sp)
-                        
+
                         first_token = True
                         gen = send_stream_fn(user_input)
                         async for token in gen:
-                            # \x00 开头是工具事件 marker，由 CliHook 已处理，跳过
-                            if token.startswith("\x00"):
-                                continue
                             if first_token:
                                 # 第一个 token 到来：关闭 spinner，开始打印
                                 # 关键：必须在 hook.set_spinner(None) 之前停止 spinner
@@ -118,7 +106,7 @@ async def run(
                             with _STDOUT_LOCK:
                                 sys.stdout.write(token)
                                 sys.stdout.flush()
-                        
+
                         # 流式结束：如果收到了 token，打印换行；否则打印 "Butler: " 前缀
                         if not first_token:
                             with _STDOUT_LOCK:
@@ -131,7 +119,7 @@ async def run(
                             with _STDOUT_LOCK:
                                 sys.stdout.write("\nButler: （无回复）\n")
                                 sys.stdout.flush()
-                        
+
                         sp.__exit__(None, None, None)
                     except KeyboardInterrupt:
                         hook.set_spinner(None)

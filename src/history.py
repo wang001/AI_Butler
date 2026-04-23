@@ -87,6 +87,24 @@ class ChatHistory:
             )
         """)
 
+        # 会话元表：会话目录、快照状态与恢复边界
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id                  TEXT PRIMARY KEY,
+                title               TEXT    NOT NULL DEFAULT '',
+                channel             TEXT    NOT NULL DEFAULT 'unknown',
+                status              TEXT    NOT NULL DEFAULT 'active',
+                preview             TEXT    NOT NULL DEFAULT '',
+                compressed_summary  TEXT    NOT NULL DEFAULT '',
+                summary_history_id  INTEGER NOT NULL DEFAULT 0,
+                tail_messages_json  TEXT    NOT NULL DEFAULT '[]',
+                created_at          REAL    NOT NULL,
+                updated_at          REAL    NOT NULL,
+                last_active_at      REAL    NOT NULL,
+                last_message_at     REAL    NOT NULL DEFAULT 0
+            )
+        """)
+
         # 兼容旧库：若列不存在则补充
         existing = {row[1] for row in cur.execute("PRAGMA table_info(messages)")}
         for col, definition in [
@@ -95,6 +113,23 @@ class ChatHistory:
         ]:
             if col not in existing:
                 cur.execute(f"ALTER TABLE messages ADD COLUMN {col} {definition}")
+
+        session_existing = {row[1] for row in cur.execute("PRAGMA table_info(sessions)")}
+        for col, definition in [
+            ("title",              "TEXT NOT NULL DEFAULT ''"),
+            ("channel",            "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("status",             "TEXT NOT NULL DEFAULT 'active'"),
+            ("preview",            "TEXT NOT NULL DEFAULT ''"),
+            ("compressed_summary", "TEXT NOT NULL DEFAULT ''"),
+            ("summary_history_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("tail_messages_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("created_at",         "REAL NOT NULL DEFAULT 0"),
+            ("updated_at",         "REAL NOT NULL DEFAULT 0"),
+            ("last_active_at",     "REAL NOT NULL DEFAULT 0"),
+            ("last_message_at",    "REAL NOT NULL DEFAULT 0"),
+        ]:
+            if col not in session_existing:
+                cur.execute(f"ALTER TABLE sessions ADD COLUMN {col} {definition}")
 
         # FTS5 虚拟表（只索引白名单角色的内容）
         cur.execute("""
@@ -120,7 +155,7 @@ class ChatHistory:
 
         self._conn.commit()
 
-    def append(self, role: str, content: str):
+    def append(self, role: str, content: str) -> int:
         """
         追加一条消息到 SQLite。
 
@@ -129,7 +164,7 @@ class ChatHistory:
         加锁保证同目录下多实例并发安全。
         """
         if not content:
-            return
+            return 0
 
         ts = time.time()
         with self._lock:
@@ -140,6 +175,312 @@ class ChatHistory:
                 (ts, role, content, self.session_id, self.channel),
             )
             self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def create_session(
+        self,
+        session_id: str | None = None,
+        channel: str | None = None,
+        title: str = "",
+        status: str = "active",
+    ) -> dict:
+        """
+        创建会话元记录；若已存在则保持原记录并返回最新状态。
+        """
+        sid = session_id or self.session_id
+        ch = channel or self.channel
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO sessions (
+                    id, title, channel, status, created_at, updated_at, last_active_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+                """,
+                (sid, title, ch, status, now, now, now),
+            )
+            self._conn.commit()
+        return self.get_session(sid) or {
+            "id": sid,
+            "title": title,
+            "channel": ch,
+            "status": status,
+            "preview": "",
+            "compressed_summary": "",
+            "summary_history_id": 0,
+            "tail_messages_json": "[]",
+            "created_at": now,
+            "updated_at": now,
+            "last_active_at": now,
+            "last_message_at": 0.0,
+        }
+
+    def touch_session(
+        self,
+        session_id: str | None = None,
+        *,
+        title: str | None = None,
+        status: str | None = None,
+        preview: str | None = None,
+        compressed_summary: str | None = None,
+        summary_history_id: int | None = None,
+        tail_messages_json: str | None = None,
+        last_active_at: float | None = None,
+        last_message_at: float | None = None,
+    ) -> None:
+        """
+        更新会话元数据 / 状态快照。
+        """
+        sid = session_id or self.session_id
+        now = time.time()
+        self.create_session(sid)
+
+        assignments = ["updated_at = ?"]
+        params: list = [now]
+
+        if title is not None:
+            assignments.append("title = ?")
+            params.append(title)
+        if status is not None:
+            assignments.append("status = ?")
+            params.append(status)
+        if preview is not None:
+            assignments.append("preview = ?")
+            params.append(preview)
+        if compressed_summary is not None:
+            assignments.append("compressed_summary = ?")
+            params.append(compressed_summary)
+        if summary_history_id is not None:
+            assignments.append("summary_history_id = ?")
+            params.append(summary_history_id)
+        if tail_messages_json is not None:
+            assignments.append("tail_messages_json = ?")
+            params.append(tail_messages_json)
+
+        assignments.append("last_active_at = ?")
+        params.append(last_active_at if last_active_at is not None else now)
+
+        if last_message_at is not None:
+            assignments.append("last_message_at = ?")
+            params.append(last_message_at)
+
+        params.append(sid)
+
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                f"UPDATE sessions SET {', '.join(assignments)} WHERE id = ?",
+                params,
+            )
+            self._conn.commit()
+
+    def get_session(self, session_id: str | None = None) -> dict | None:
+        """读取单个会话元数据。"""
+        sid = session_id or self.session_id
+        try:
+            self._conn.commit()
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                SELECT id, title, channel, status, preview,
+                       compressed_summary, summary_history_id, tail_messages_json,
+                       created_at, updated_at, last_active_at, last_message_at
+                FROM sessions
+                WHERE id = ?
+                """,
+                (sid,),
+            )
+            row = cur.fetchone()
+        except sqlite3.OperationalError:
+            return None
+
+        if not row:
+            return None
+
+        return {
+            "id": row[0],
+            "title": row[1],
+            "channel": row[2],
+            "status": row[3],
+            "preview": row[4],
+            "compressed_summary": row[5],
+            "summary_history_id": row[6],
+            "tail_messages_json": row[7],
+            "created_at": row[8],
+            "updated_at": row[9],
+            "last_active_at": row[10],
+            "last_message_at": row[11],
+        }
+
+    def list_sessions(
+        self,
+        limit: int = 50,
+        channel: str | None = None,
+        status: str | None = None,
+    ) -> list[dict]:
+        """按最近活跃时间列出会话。"""
+        limit = min(max(1, limit), 200)
+        conditions: list[str] = []
+        params: list = []
+        if channel:
+            conditions.append("channel = ?")
+            params.append(channel)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(limit)
+
+        try:
+            self._conn.commit()
+            cur = self._conn.cursor()
+            cur.execute(
+                f"""
+                SELECT id, title, channel, status, preview,
+                       compressed_summary, summary_history_id, tail_messages_json,
+                       created_at, updated_at, last_active_at, last_message_at
+                FROM sessions
+                {where}
+                ORDER BY last_active_at DESC, updated_at DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        return [
+            {
+                "id": row[0],
+                "title": row[1],
+                "channel": row[2],
+                "status": row[3],
+                "preview": row[4],
+                "compressed_summary": row[5],
+                "summary_history_id": row[6],
+                "tail_messages_json": row[7],
+                "created_at": row[8],
+                "updated_at": row[9],
+                "last_active_at": row[10],
+                "last_message_at": row[11],
+            }
+            for row in rows
+        ]
+
+    def get_session_messages(
+        self,
+        session_id: str | None = None,
+        limit: int = 200,
+        before_id: int | None = None,
+    ) -> list[dict]:
+        """按会话读取历史消息。"""
+        sid = session_id or self.session_id
+        limit = min(max(1, limit), 500)
+        conditions = ["session_id = ?"]
+        params: list = [sid]
+
+        if before_id is not None:
+            conditions.append("id < ?")
+            params.append(before_id)
+
+        params.append(limit)
+
+        try:
+            self._conn.commit()
+            cur = self._conn.cursor()
+            cur.execute(
+                f"""
+                SELECT id, ts, role, content, session_id, channel
+                FROM messages
+                WHERE {' AND '.join(conditions)}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        return [
+            {
+                "id": row[0],
+                "ts": row[1],
+                "role": row[2],
+                "content": row[3],
+                "session_id": row[4],
+                "channel": row[5],
+            }
+            for row in reversed(rows)
+        ]
+
+    def get_last_message_id(self, session_id: str | None = None) -> int:
+        """读取会话最新一条消息的主键 id。"""
+        sid = session_id or self.session_id
+        try:
+            self._conn.commit()
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                (sid,),
+            )
+            row = cur.fetchone()
+        except sqlite3.OperationalError:
+            return 0
+        return int(row[0]) if row else 0
+
+    def get_summary_boundary_id(
+        self,
+        tail_history_rows: int,
+        session_id: str | None = None,
+    ) -> int:
+        """
+        根据“当前 tail 覆盖的历史行数”推导摘要边界。
+
+        返回值含义：
+          当前 compressed_summary 至少已经覆盖到的最后一条 history.message.id。
+        """
+        sid = session_id or self.session_id
+        if tail_history_rows <= 0:
+            return self.get_last_message_id(sid)
+
+        try:
+            self._conn.commit()
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                SELECT id
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (sid, tail_history_rows),
+            )
+            tail_ids = [int(row[0]) for row in cur.fetchall()]
+            if not tail_ids:
+                return 0
+            oldest_tail_id = tail_ids[-1]
+            cur.execute(
+                """
+                SELECT id
+                FROM messages
+                WHERE session_id = ? AND id < ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (sid, oldest_tail_id),
+            )
+            row = cur.fetchone()
+        except sqlite3.OperationalError:
+            return 0
+
+        return int(row[0]) if row else 0
 
     def get_by_date(
         self,
@@ -181,6 +522,7 @@ class ChatHistory:
         where = " AND ".join(conditions)
 
         try:
+            self._conn.commit()
             cur = self._conn.cursor()
             cur.execute(
                 f"SELECT ts, role, content, session_id, channel "
@@ -241,6 +583,7 @@ class ChatHistory:
         where = " AND ".join(conditions)
 
         try:
+            self._conn.commit()
             cur = self._conn.cursor()
             cur.execute(
                 f"""
@@ -305,6 +648,7 @@ class ChatHistory:
         params.append(limit)
 
         try:
+            self._conn.commit()
             cur = self._conn.cursor()
             cur.execute(
                 f"SELECT ts, role, content, session_id, channel "
@@ -320,6 +664,115 @@ class ChatHistory:
              "session_id": sid, "channel": ch}
             for ts, role_, content, sid, ch in rows
         ]
+
+    def get_since_id(
+        self,
+        since_id: int,
+        limit: int = 500,
+        roles: list[str] | tuple[str, ...] | None = None,
+        channel: str | None = None,
+        max_id: int | None = None,
+    ) -> list[dict]:
+        """
+        查询指定 message.id 之后的对话记录（按主键增量读取）。
+
+        Args:
+            since_id : 起始 message.id（不包含该 id）
+            limit    : 最多返回条数，默认 500，最大 2000
+            roles    : 可选，只返回指定角色列表
+            channel  : 可选，只返回指定渠道
+            max_id   : 可选，只返回 <= 该 id 的记录
+
+        Returns:
+            list of {"id", "ts", "role", "content", "session_id", "channel"}，
+            按 id 升序
+        """
+        limit = min(max(1, limit), 2000)
+        conditions = ["id > ?"]
+        params: list = [since_id]
+
+        if max_id is not None:
+            conditions.append("id <= ?")
+            params.append(max_id)
+
+        if roles:
+            placeholders = ", ".join("?" for _ in roles)
+            conditions.append(f"role IN ({placeholders})")
+            params.extend(list(roles))
+
+        if channel:
+            conditions.append("channel = ?")
+            params.append(channel)
+
+        where = " AND ".join(conditions)
+        params.append(limit)
+
+        try:
+            self._conn.commit()
+            cur = self._conn.cursor()
+            cur.execute(
+                f"""
+                SELECT id, ts, role, content, session_id, channel
+                FROM messages
+                WHERE {where}
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        return [
+            {
+                "id": row[0],
+                "ts": row[1],
+                "role": row[2],
+                "content": row[3],
+                "session_id": row[4],
+                "channel": row[5],
+            }
+            for row in rows
+        ]
+
+    def get_latest_message_id(
+        self,
+        *,
+        roles: list[str] | tuple[str, ...] | None = None,
+        channel: str | None = None,
+    ) -> int:
+        """
+        读取全局最新一条消息的主键 id。
+
+        可按角色 / 渠道过滤；不传 session_id，适合 app 级扫描全部会话。
+        """
+        conditions: list[str] = []
+        params: list = []
+
+        if roles:
+            placeholders = ", ".join("?" for _ in roles)
+            conditions.append(f"role IN ({placeholders})")
+            params.extend(list(roles))
+
+        if channel:
+            conditions.append("channel = ?")
+            params.append(channel)
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        try:
+            self._conn.commit()
+            cur = self._conn.cursor()
+            cur.execute(
+                f"SELECT id FROM messages {where} ORDER BY id DESC LIMIT 1",
+                params,
+            )
+            row = cur.fetchone()
+        except sqlite3.OperationalError:
+            return 0
+
+        return int(row[0]) if row else 0
 
     @staticmethod
     def _fts_query(query: str) -> str:

@@ -21,11 +21,13 @@ Butler 类现在是一个薄协调层，组合上述模块完成推理流程。
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import threading
+import time
 import uuid
 import warnings
 from pathlib import Path
-from typing import AsyncGenerator, Callable, TYPE_CHECKING
+from typing import Any, AsyncGenerator, Callable, TYPE_CHECKING
 
 from openai import AsyncOpenAI
 
@@ -33,6 +35,7 @@ from agent.hooks import AgentHook, CompositeHook
 from agent.memory import MemoryManager
 from agent.context import ContextBuilder
 from agent.runner import AgentRunner
+from agent.stream_events import StreamEvent
 
 if TYPE_CHECKING:
     from config import Config
@@ -47,6 +50,7 @@ __all__ = [
     "MemoryManager",
     "ContextBuilder",
     "AgentRunner",
+    "StreamEvent",
 ]
 
 
@@ -120,6 +124,11 @@ class Butler:
         cfg: "Config",
         channel: str = "unknown",
         hook: AgentHook | None = None,
+        session_id: str | None = None,
+        initial_messages: list[dict] | None = None,
+        initial_compressed_summary: str = "",
+        session_title: str = "",
+        memory_update_service: Any = None,
     ) -> "Butler":
         """
         工厂方法：初始化所有依赖组件，返回可用的 Butler 实例。
@@ -129,7 +138,7 @@ class Butler:
             channel : 渠道标识（"cli" / "feishu" / "wecom" / "api"）
             hook    : AgentHook 实例，用于接收工具调用/流式 token 等事件
         """
-        session_id = str(uuid.uuid4())
+        session_id = session_id or str(uuid.uuid4())
 
         src_dir = Path(__file__).parent.parent
         system_prompt = (src_dir / "prompts" / "system.txt").read_text(encoding="utf-8")
@@ -153,13 +162,10 @@ class Butler:
             session_id=session_id,
             channel=channel,
         )
-
-        from cron import MemoryUpdateService
-        memory_update_service = MemoryUpdateService(
-            cfg=cfg,
-            history=history,
-            reme=memory.reme,
-            llm_model=cfg.llm_model,
+        history.create_session(
+            session_id=session_id,
+            channel=channel,
+            title=session_title,
         )
 
         command_executor = None
@@ -220,6 +226,8 @@ class Butler:
             channel=channel,
         )
         inst._memory_update_service = memory_update_service
+        inst._messages = list(initial_messages or [])
+        inst._compressed_summary = initial_compressed_summary or ""
         return inst
 
     async def chat(self, user_input: str) -> str:
@@ -239,20 +247,20 @@ class Butler:
         reply, new_msgs = await self._runner.run(final_messages)
 
         self._messages.extend(new_msgs)
-        self._history.append("user", user_input)
-        if reply:
-            self._history.append("assistant", reply)
+        self._persist_turn(user_input=user_input, new_msgs=new_msgs, reply=reply)
 
         return reply
 
-    async def chat_stream(self, user_input: str) -> AsyncGenerator[str, None]:
+    async def chat_stream(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
         """
         处理一条用户消息，以 AsyncGenerator 逐 token yield 回复（流式）。
 
         yield 内容：
-          - 普通字符串：回复文本 token
-          - \\x00TOOL_CALL:{json}    工具开始调用事件
-          - \\x00TOOL_RESULT:{json}  工具执行完毕事件
+          - start / finish               消息生命周期
+          - start-step / finish-step     单次 LLM step 生命周期
+          - reasoning-*                  过程性思考文本
+          - tool-input-* / tool-output-* 工具调用与结果
+          - text-*                       最终回复正文
         """
         final_messages, self._messages, self._compressed_summary = (
             await self._context_builder.build_context(
@@ -265,32 +273,134 @@ class Butler:
 
         reply_parts: list[str] = []
         new_msgs: list[dict] = []
+        message_id = f"msg_{uuid.uuid4().hex}"
+
+        yield {"type": "start", "messageId": message_id}
 
         async for item in self._runner.run_stream(final_messages):
-            if isinstance(item, str):
+            if isinstance(item, dict):
                 yield item
-                if not item.startswith("\x00"):
-                    reply_parts.append(item)
+                if item["type"] == "text-delta":
+                    reply_parts.append(item["delta"])
             else:
                 new_msgs = item
 
         reply = "".join(reply_parts)
+        yield {"type": "finish", "finishReason": "stop"}
 
         self._messages.extend(new_msgs)
+        self._persist_turn(user_input=user_input, new_msgs=new_msgs, reply=reply)
+
+    def touch_session(self) -> None:
+        """刷新会话活跃时间。"""
+        self._history.touch_session(
+            status="active",
+            last_active_at=time.time(),
+        )
+
+    def snapshot_state(self) -> dict:
+        """导出会话运行态，用于热态回收后的恢复。"""
+        tail_history_rows = self._count_history_rows_in_runtime_messages(self._messages)
+        return {
+            "session_id": self.session_id,
+            "compressed_summary": self._compressed_summary,
+            "tail_messages": self._messages,
+            "tail_history_rows": tail_history_rows,
+            "summary_history_id": self._history.get_summary_boundary_id(tail_history_rows),
+        }
+
+    def _persist_turn(self, user_input: str, new_msgs: list[dict], reply: str) -> None:
+        """
+        将本轮 user / assistant / tool_call 持久化到 history，
+        并更新 sessions 表里的恢复快照。
+        """
         self._history.append("user", user_input)
-        if reply:
-            self._history.append("assistant", reply)
+
+        for msg in new_msgs:
+            role = msg.get("role")
+            content = msg.get("content") or ""
+
+            if role == "assistant" and content:
+                self._history.append("assistant", content)
+
+            if role == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    payload = {
+                        "id": tc.get("id"),
+                        "name": ((tc.get("function") or {}).get("name")),
+                        "arguments": ((tc.get("function") or {}).get("arguments")),
+                    }
+                    self._history.append(
+                        "tool_call",
+                        json.dumps(payload, ensure_ascii=False),
+                    )
+
+        self._persist_session_state(preview=reply or user_input)
+        if getattr(self, "_memory_update_service", None):
+            self._memory_update_service.notify_new_messages()
+
+    def _persist_session_state(self, preview: str = "") -> None:
+        tail_history_rows = self._count_history_rows_in_runtime_messages(self._messages)
+        title = self._suggest_session_title()
+        self._history.touch_session(
+            title=title,
+            status="active",
+            preview=(preview or "").strip()[:240],
+            compressed_summary=self._compressed_summary,
+            summary_history_id=self._history.get_summary_boundary_id(tail_history_rows),
+            tail_messages_json=json.dumps(self._messages, ensure_ascii=False),
+            last_active_at=time.time(),
+            last_message_at=time.time(),
+        )
+
+    def _suggest_session_title(self) -> str:
+        current = self._history.get_session() or {}
+        existing = (current.get("title") or "").strip()
+        if existing and existing != "新会话":
+            return existing
+
+        for msg in self._messages:
+            if msg.get("role") == "user" and (msg.get("content") or "").strip():
+                content = (msg.get("content") or "").strip().splitlines()[0]
+                return (content[:30] + "…") if len(content) > 30 else content
+        return existing or "新会话"
+
+    @staticmethod
+    def _count_history_rows_in_runtime_messages(messages: list[dict]) -> int:
+        """
+        估算当前 tail 在 history 表里对应多少条“可重建”的历史行。
+
+        规则：
+          - user / assistant(content) 各记 1 条
+          - assistant.tool_calls 中的每个 tool_call 记 1 条 role=tool_call
+          - tool 结果不入 history 恢复轨迹
+        """
+        rows = 0
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content") or ""
+            if role in ("user", "assistant") and content:
+                rows += 1
+            if role == "assistant" and msg.get("tool_calls"):
+                rows += len(msg["tool_calls"])
+        return rows
 
     async def close(self):
         """退出时调用：沉淀记忆、关闭资源。"""
+        self._history.touch_session(
+            status="idle",
+            compressed_summary=self._compressed_summary,
+            summary_history_id=self._history.get_summary_boundary_id(
+                self._count_history_rows_in_runtime_messages(self._messages)
+            ),
+            tail_messages_json=json.dumps(self._messages, ensure_ascii=False),
+            last_active_at=time.time(),
+        )
         if self._dispatcher.browser_agent:
             try:
                 await self._dispatcher.browser_agent.close()
             except Exception:
                 pass
-
-        if getattr(self, "_memory_update_service", None):
-            await self._memory_update_service.stop()
 
         await self._memory.settle(self._messages)
         await self._memory.close()

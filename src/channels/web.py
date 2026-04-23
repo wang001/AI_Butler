@@ -1,43 +1,27 @@
 """
 channels/web.py — Web 消息渠道（HTTP REST + SSE + WebSocket）
 
-统一的 Web Channel，遵循与 cli.py / feishu.py 相同的 Channel 约定：
-  - 接收来自浏览器的用户输入
-  - 通过 app.send() / app.send_stream() 与 Agent 通信
-  - 将 Agent 的流式 token 翻译为 JSON 帧，通过 WebSocket / SSE 推送给前端
+流式协议尽量贴近 AI SDK UI message stream：
+  - start / finish
+  - start-step / finish-step
+  - text-start / text-delta / text-end
+  - reasoning-start / reasoning-delta / reasoning-end
+  - tool-input-start / tool-input-delta / tool-input-available
+  - tool-output-available
+  - error
 
-路由说明（在 gateway/server.py 以 prefix="/api" 挂载）：
-  POST /api/chat           非流式问答（返回完整 JSON）
-  POST /api/chat/stream    SSE 流式问答（text/event-stream）
-  WS   /api/ws             WebSocket 流式对话（JSON 消息帧）
-
-─── WebSocket 消息协议 ────────────────────────────────────────────────────
-  客户端 → 服务端：纯文本（用户输入）
-
-  服务端 → 客户端：JSON 消息帧，type 字段区分：
-    {"type": "token",       "text": "..."}               回复文本 token（逐字追加）
-    {"type": "tool_call",   "name": "...", "args": {...}} 工具开始调用（含参数）
-    {"type": "tool_result", "name": "..."}                工具执行完毕
-    {"type": "done"}                                       本轮回复结束
-    {"type": "ping"}                                       保活帧（忽略）
-    {"type": "error",       "message": "..."}              错误
-
-─── SSE 消息协议 ────────────────────────────────────────────────────────
-  每行格式：data: <JSON帧>\n\n
-  JSON 结构与 WebSocket 帧相同，最后一帧 type=done。
+SSE 是对外的 canonical API，额外携带
+`x-vercel-ai-ui-message-stream: v1` 以便兼容现有开源生态。
+WebSocket 则复用相同 JSON chunk，作为浏览器本地页面的便捷传输层。
 """
 from __future__ import annotations
 
 import asyncio
 import json
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-
-# 工具事件 marker 前缀（由 agent.runner.AgentRunner.run_stream 发出）
-_TOOL_CALL_PREFIX   = "\x00TOOL_CALL:"
-_TOOL_RESULT_PREFIX = "\x00TOOL_RESULT:"
 
 # WebSocket ping 间隔（秒）：防止工具执行期间（可能几十秒）连接被代理/浏览器超时关闭
 _WS_PING_INTERVAL = 20
@@ -45,59 +29,52 @@ _WS_PING_INTERVAL = 20
 router = APIRouter()
 
 
-# ── 内部：token → JSON 帧 ──────────────────────────────────────────────────────
-
-def _parse_token(token: str) -> dict:
-    """
-    将 agent 内部 token 转换为 JSON 帧 dict。
-
-    普通文本 → {"type": "token", "text": "..."}
-    工具调用 → {"type": "tool_call",   "name": "...", "args": {...}}
-    工具结果 → {"type": "tool_result", "name": "..."}
-
-    marker 格式（agent.runner.AgentRunner.run_stream）：
-      TOOL_CALL   前缀后跟 {"name":"...", "args":{...}} JSON
-      TOOL_RESULT 前缀后跟 {"name":"..."} JSON
-    """
-    if token.startswith(_TOOL_CALL_PREFIX):
-        payload_str = token[len(_TOOL_CALL_PREFIX):]
-        try:
-            payload = json.loads(payload_str)
-            return {"type": "tool_call", "name": payload["name"], "args": payload.get("args", {})}
-        except Exception:
-            return {"type": "tool_call", "name": payload_str, "args": {}}
-
-    if token.startswith(_TOOL_RESULT_PREFIX):
-        payload_str = token[len(_TOOL_RESULT_PREFIX):]
-        try:
-            payload = json.loads(payload_str)
-            return {"type": "tool_result", "name": payload["name"]}
-        except Exception:
-            return {"type": "tool_result", "name": payload_str}
-
-    return {"type": "token", "text": token}
-
-
 def _frame(data: dict) -> str:
     """序列化 JSON 帧为字符串（WebSocket send_text / SSE data 共用）。"""
     return json.dumps(data, ensure_ascii=False)
+
+
+def _public_session(session: dict | None) -> dict | None:
+    """向前端返回轻量会话摘要，避免把 runtime 快照直接暴露给 UI。"""
+    if not session:
+        return None
+    return {
+        "id": session.get("id", ""),
+        "title": session.get("title", ""),
+        "channel": session.get("channel", "unknown"),
+        "status": session.get("status", "active"),
+        "preview": session.get("preview", ""),
+        "created_at": session.get("created_at", 0),
+        "updated_at": session.get("updated_at", 0),
+        "last_active_at": session.get("last_active_at", 0),
+        "last_message_at": session.get("last_message_at", 0),
+    }
 
 
 # ── 非流式 REST ────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     message: str
+    conversationId: str | None = None
 
 
 class ChatResponse(BaseModel):
     reply: str
 
 
+class SessionCreateRequest(BaseModel):
+    title: str = "新会话"
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     """单轮问答接口（REST，非流式，返回完整回复）。"""
     from gateway.server import get_app
-    reply = await get_app().send(req.message)
+    reply = await get_app().send(
+        req.message,
+        session_id=req.conversationId,
+        channel="web",
+    )
     return ChatResponse(reply=reply)
 
 
@@ -106,31 +83,83 @@ async def chat(req: ChatRequest) -> ChatResponse:
 @router.post("/chat/stream")
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
     """
-    SSE 流式问答接口（text/event-stream）。
+    SSE 流式问答接口（AI SDK 风格 UI message stream）。
 
     每条事件：data: <JSON帧>\\n\\n
-    结束事件：data: {"type":"done"}\\n\\n
+    流结束：data: [DONE]\\n\\n
     """
     from gateway.server import get_app
     app = get_app()
 
     async def event_generator():
         try:
-            async for token in app.send_stream(req.message):
-                yield f"data: {_frame(_parse_token(token))}\n\n"
+            async for event in app.send_event_stream(
+                req.message,
+                session_id=req.conversationId,
+                channel="web",
+            ):
+                frame = dict(event)
+                if req.conversationId:
+                    frame["conversationId"] = req.conversationId
+                yield f"data: {_frame(frame)}\n\n"
         except Exception as exc:
-            yield f"data: {_frame({'type': 'error', 'message': str(exc)})}\n\n"
+            yield f"data: {_frame({'type': 'error', 'errorText': str(exc)})}\n\n"
+            yield f"data: {_frame({'type': 'finish', 'finishReason': 'error'})}\n\n"
         finally:
-            yield f"data: {_frame({'type': 'done'})}\n\n"
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
+            "x-vercel-ai-ui-message-stream": "v1",
             "X-Accel-Buffering": "no",   # 禁用 Nginx 缓冲，确保实时推送
         },
     )
+
+
+# ── 会话元接口 ──────────────────────────────────────────────────────────────────
+
+@router.post("/sessions")
+async def create_session(req: SessionCreateRequest | None = None) -> dict:
+    """创建新的 Web 会话。"""
+    from gateway.server import get_app
+    app = get_app()
+    session = await app.create_session(
+        channel="web",
+        title=(req.title if req else "新会话"),
+    )
+    return _public_session(session) or {}
+
+
+@router.get("/sessions")
+async def list_sessions(limit: int = Query(default=50, ge=1, le=200)) -> dict:
+    """列出最近活跃的 Web 会话。"""
+    from gateway.server import get_app
+    app = get_app()
+    sessions = app.list_sessions(channel="web", limit=limit)
+    return {"sessions": [_public_session(session) for session in sessions]}
+
+
+@router.get("/sessions/{session_id}")
+async def get_session(session_id: str) -> dict:
+    """读取单个会话元信息。"""
+    from gateway.server import get_app
+    app = get_app()
+    session = app.get_session(session_id)
+    return {"session": _public_session(session)}
+
+
+@router.get("/sessions/{session_id}/messages")
+async def get_session_messages(
+    session_id: str,
+    limit: int = Query(default=200, ge=1, le=500),
+) -> dict:
+    """读取某个会话的历史消息。"""
+    from gateway.server import get_app
+    app = get_app()
+    return {"messages": app.get_session_messages(session_id, limit=limit)}
 
 
 # ── WebSocket 流式对话 ─────────────────────────────────────────────────────────
@@ -152,10 +181,10 @@ async def chat_ws(websocket: WebSocket):
     from gateway.server import get_app
     app = get_app()
 
-    async def _stream_with_ping(text: str) -> None:
+    async def _stream_with_ping(text: str, conversation_id: str | None) -> None:
         """
         并发执行两个协程：
-        - 主流：消费 app.send_stream()，将每个 token 转为 JSON 帧发送
+        - 主流：消费 app.send_event_stream()，将每个事件转为 JSON 帧发送
         - 副流：每隔 _WS_PING_INTERVAL 秒发送一次 {"type":"ping"} 保活帧
         两者通过 done_event 协调退出。
         """
@@ -175,12 +204,18 @@ async def chat_ws(websocket: WebSocket):
 
         ping_task = asyncio.create_task(_pinger())
         try:
-            async for token in app.send_stream(text):
-                await websocket.send_text(_frame(_parse_token(token)))
-            await websocket.send_text(_frame({"type": "done"}))
+            async for event in app.send_event_stream(
+                text,
+                session_id=conversation_id,
+                channel="web",
+            ):
+                frame = dict(event)
+                if conversation_id:
+                    frame["conversationId"] = conversation_id
+                await websocket.send_text(_frame(frame))
         except Exception as exc:
-            await websocket.send_text(_frame({"type": "error", "message": str(exc)}))
-            await websocket.send_text(_frame({"type": "done"}))
+            await websocket.send_text(_frame({"type": "error", "errorText": str(exc)}))
+            await websocket.send_text(_frame({"type": "finish", "finishReason": "error"}))
         finally:
             done_event.set()
             ping_task.cancel()
@@ -191,7 +226,17 @@ async def chat_ws(websocket: WebSocket):
 
     try:
         while True:
-            text = await websocket.receive_text()
-            await _stream_with_ping(text)
+            incoming = await websocket.receive_text()
+            conversation_id = None
+            text = incoming
+            try:
+                payload = json.loads(incoming)
+                if isinstance(payload, dict) and payload.get("type") == "input":
+                    text = str(payload.get("text") or "")
+                    conversation_id = payload.get("conversationId")
+            except Exception:
+                pass
+
+            await _stream_with_ping(text, conversation_id)
     except WebSocketDisconnect:
         pass
