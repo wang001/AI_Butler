@@ -2,7 +2,7 @@
 #
 # 目录架构（三层隔离）：
 #
-#   /app          (只读)  应用代码、prompts、vendor 工具、Python 依赖
+#   /app          (只读)  应用代码、prompts、Python 依赖
 #                         镜像构建时 COPY 进来，运行时不可写
 #
 #   /data         (读写)  持久化数据，宿主机挂载
@@ -36,7 +36,6 @@ RUN playwright install --with-deps chromium
 
 # ── 应用代码（只读层，镜像内置） ──
 COPY src/ ./src/
-COPY vendor/ ./vendor/
 COPY .env.example ./.env.example
 
 # ── 创建可写挂载点（运行时由 docker-compose 挂载宿主机目录） ──
