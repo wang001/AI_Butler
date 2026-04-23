@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-tools/search_engine.py — 无 API Key 的网页搜索引擎
+tools/web_search_tool/search_engine.py — 无 API Key 的网页搜索引擎
 
 基于页面抓取实现百度 / Bing 国际版搜索，不依赖额外搜索平台聚合器。
 """

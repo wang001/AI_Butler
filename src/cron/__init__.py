@@ -15,32 +15,29 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from agent.runner import AgentRunner
-from tools.memory import MemoryTools
-from tools.memory import MEMORY_READONLY_TOOLS
+from tools.executor import ToolExecutor
+from tools.memory_tools import MemoryTools, SearchHistoryTool, SearchMemoryTool
+from tools.registry import ToolRegistry
 
 
 class _MemoryOnlyDispatcher:
     """只给 MEMORY.md 更新暴露记忆相关工具，避免无关工具污染输出。"""
 
     def __init__(self, *, reme, history, memory_update_service):
-        self._memory_tools = MemoryTools(
+        memory_tools = MemoryTools(
             reme=reme,
             history=history,
             memory_update_service=memory_update_service,
         )
-        self.tools = MEMORY_READONLY_TOOLS
+        self._registry = ToolRegistry([
+            SearchMemoryTool(memory_tools),
+            SearchHistoryTool(memory_tools),
+        ])
+        self._executor = ToolExecutor(registry=self._registry)
+        self.tools = self._registry.tools
 
     async def run(self, name: str, arguments: str) -> str:
-        try:
-            args = json.loads(arguments) if arguments else {}
-        except json.JSONDecodeError:
-            args = {}
-
-        if name == "search_memory":
-            return await self._memory_tools.search_memory(**args)
-        if name == "search_history":
-            return self._memory_tools.search_history(**args)
-        return f"[未知工具: {name}]"
+        return await self._executor.run(name, arguments)
 
 
 class MemoryUpdateService:

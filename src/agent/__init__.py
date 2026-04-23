@@ -35,7 +35,7 @@ from agent.hooks import AgentHook, CompositeHook
 from agent.memory import MemoryManager
 from agent.context import ContextBuilder
 from agent.runner import AgentRunner
-from agent.stream_events import StreamEvent
+from event import StreamEvent, make_agent_event, to_stream_events
 
 if TYPE_CHECKING:
     from config import Config
@@ -171,7 +171,7 @@ class Butler:
         command_executor = None
         if cfg.command_enabled:
             try:
-                from tools.command import CommandExecutor, CommandConfig
+                from tools.run_command_tool import CommandExecutor, CommandConfig
                 command_executor = CommandExecutor(CommandConfig(
                     workdir=cfg.workspace_dir,
                     default_timeout=cfg.command_default_timeout,
@@ -182,7 +182,7 @@ class Butler:
         browser_agent = None
         if cfg.browser_enabled:
             try:
-                from tools.browser import BrowserAgent, BrowserUseConfig
+                from tools.browser_use_tool import BrowserAgent, BrowserUseConfig
                 browser_agent = BrowserAgent(BrowserUseConfig(
                     headless=cfg.browser_headless,
                     max_steps=cfg.browser_max_steps,
@@ -275,18 +275,38 @@ class Butler:
         new_msgs: list[dict] = []
         message_id = f"msg_{uuid.uuid4().hex}"
 
-        yield {"type": "start", "messageId": message_id}
+        started = make_agent_event(
+            kind="message.started",
+            source="agent",
+            conversation_id=self.session_id,
+            message_id=message_id,
+        )
+        for stream_event in to_stream_events(started):
+            yield stream_event
 
-        async for item in self._runner.run_stream(final_messages):
+        async for item in self._runner.run_stream(
+            final_messages,
+            conversation_id=self.session_id,
+            message_id=message_id,
+        ):
             if isinstance(item, dict):
-                yield item
-                if item["type"] == "text-delta":
-                    reply_parts.append(item["delta"])
+                for stream_event in to_stream_events(item):
+                    yield stream_event
+                if item["kind"] == "text.delta":
+                    reply_parts.append(str(item["payload"].get("delta") or ""))
             else:
                 new_msgs = item
 
         reply = "".join(reply_parts)
-        yield {"type": "finish", "finishReason": "stop"}
+        finished = make_agent_event(
+            kind="message.finished",
+            source="agent",
+            conversation_id=self.session_id,
+            message_id=message_id,
+            payload={"finishReason": "stop"},
+        )
+        for stream_event in to_stream_events(finished):
+            yield stream_event
 
         self._messages.extend(new_msgs)
         self._persist_turn(user_input=user_input, new_msgs=new_msgs, reply=reply)

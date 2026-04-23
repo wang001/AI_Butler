@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-tools/web_fetcher.py — 轻量网页正文抓取工具
+tools/web_fetcher_tool.py — 轻量网页正文抓取工具
 
 实现思路参考 shirenchuang/web-content-fetcher：
   - 直接通过 HTTP 抓取页面
@@ -21,6 +21,8 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from lxml import html
+
+from tools.base import Tool
 
 
 WEB_FETCHER_TOOLS: list[dict] = [
@@ -400,3 +402,44 @@ def web_fetcher(
         lines.append(f"最大字符数：{max_chars}")
     lines.extend(["", content])
     return "\n".join(lines)
+
+
+class WebFetcherTool(Tool):
+    @property
+    def name(self) -> str:
+        return "web_fetcher"
+
+    @property
+    def description(self) -> str:
+        return (
+            "抓取指定网页 URL 的正文内容。"
+            "适用于用户已经提供具体网页链接，想提取文章正文、公告内容、博客内容、文档页面内容等场景。"
+            "默认输出 markdown；如果只要纯文本，可设为 text。"
+            "此工具不执行 JavaScript，也不处理登录态。遇到强依赖 JS 的页面，请改用 browser_use。"
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return WEB_FETCHER_TOOLS[0]["function"]["parameters"]
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def concurrency_safe(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        url: str,
+        extract_mode: str = "markdown",
+        max_chars: int = 12000,
+        timeout: int = 20,
+    ) -> str:
+        return web_fetcher(
+            url=url,
+            extract_mode=extract_mode,
+            max_chars=max_chars,
+            timeout=timeout,
+        )

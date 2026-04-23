@@ -18,6 +18,8 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
+from tools.base import Tool
+
 # ── OpenAI function-calling schema ────────────────────────────────────────────
 
 COMMAND_TOOLS: list[dict] = [
@@ -136,3 +138,56 @@ class CommandExecutor:
                 "exit_code": -1, "timed_out": False,
                 "error": f"执行异常: {e}",
             }
+
+
+class RunCommandTool(Tool):
+    def __init__(self, executor: CommandExecutor):
+        self._executor = executor
+
+    @property
+    def name(self) -> str:
+        return "run_command"
+
+    @property
+    def description(self) -> str:
+        return (
+            "在容器环境中执行 shell 命令。"
+            "用于文件操作、数据处理、代码运行、系统信息查询等。"
+            "工作目录为 /workspace，可读写。"
+            "容器本身提供安全隔离，命令不会影响宿主机。"
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return COMMAND_TOOLS[0]["function"]["parameters"]
+
+    async def execute(
+        self,
+        command: str,
+        timeout: int = 30,
+        workdir: str | None = None,
+    ) -> str:
+        result = await self._executor.run(
+            command=command,
+            timeout=timeout,
+            workdir=workdir,
+        )
+
+        if result.get("error"):
+            return f"[命令执行失败] {result['error']}"
+
+        parts = []
+        if result.get("timed_out"):
+            parts.append(f"[超时] 命令执行超过 {timeout} 秒限制")
+
+        stdout = result.get("stdout", "")
+        stderr = result.get("stderr", "")
+        if stdout:
+            parts.append(f"[stdout]\n{stdout}")
+        if stderr:
+            parts.append(f"[stderr]\n{stderr}")
+        if not stdout and not stderr:
+            parts.append("（命令无输出）")
+
+        parts.append(f"[退出码] {result.get('exit_code', -1)}")
+        return "\n".join(parts)

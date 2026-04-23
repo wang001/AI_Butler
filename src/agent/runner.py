@@ -28,7 +28,7 @@ import uuid
 from typing import Any, AsyncGenerator, TYPE_CHECKING
 
 from openai import AsyncOpenAI
-from agent.stream_events import StreamEvent
+from event import AgentEvent, make_agent_event, new_event_id
 
 if TYPE_CHECKING:
     from agent.hooks import AgentHook
@@ -447,14 +447,12 @@ class AgentRunner:
         """
         执行一批工具调用（批内按并发安全性分组并行），返回 (tool_call_id, name, result)。
         """
-        from tools import TOOL_CONCURRENT_SAFE
-
         # 按并发安全性分批：相邻安全工具合并并行，不安全工具独占串行
         batches: list[list] = []
         for tc in tool_calls:
-            safe = TOOL_CONCURRENT_SAFE.get(tc.function.name, False)
+            safe = self._dispatcher.concurrent_safe(tc.function.name)
             if safe and batches and all(
-                TOOL_CONCURRENT_SAFE.get(t.function.name, False) for t in batches[-1]
+                self._dispatcher.concurrent_safe(t.function.name) for t in batches[-1]
             ):
                 batches[-1].append(tc)
             else:
@@ -540,12 +538,14 @@ class AgentRunner:
     async def run_stream(
         self,
         messages: list[dict],
-    ) -> AsyncGenerator[StreamEvent | list[dict], None]:
+        conversation_id: str = "",
+        message_id: str = "",
+    ) -> AsyncGenerator[AgentEvent | list[dict], None]:
         """
         Tool Call 循环（流式版本）。
 
         yield 三类内容：
-          - StreamEvent                        流式结构化事件
+          - AgentEvent                         内部 canonical 事件
           - list[dict]（最后一次）            new_messages，供 Butler 做持久化
 
         工具调用阶段：非流式等待工具完成。
@@ -555,7 +555,14 @@ class AgentRunner:
         new_messages: list[dict] = []
 
         for _ in range(MAX_TOOL_ROUNDS):
-            yield {"type": "start-step"}
+            step_id = new_event_id("step")
+            yield make_agent_event(
+                kind="step.started",
+                source="agent",
+                conversation_id=conversation_id,
+                message_id=message_id,
+                step_id=step_id,
+            )
 
             # 先非流式探测是否有 tool_calls
             if self._hook:
@@ -578,13 +585,25 @@ class AgentRunner:
             if not msg.tool_calls:
                 # 没有工具调用 → 以流式重新请求并 yield 结构化事件
                 reply_parts: list[str] = []
-                async for event in self._stream_reply(messages + new_messages):
-                    if event["type"] == "text-delta":
-                        reply_parts.append(event["delta"])
+                async for event in self._stream_reply(
+                    messages + new_messages,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                ):
+                    if event["kind"] == "text.delta":
+                        reply_parts.append(str(event["payload"].get("delta") or ""))
                         if self._hook:
-                            await self._hook.on_stream_token(event["delta"])
+                            await self._hook.on_stream_token(str(event["payload"].get("delta") or ""))
                     yield event
-                yield {"type": "finish-step", "finishReason": "stop"}
+                yield make_agent_event(
+                    kind="step.finished",
+                    source="agent",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"finishReason": "stop"},
+                )
                 new_messages.append({"role": "assistant", "content": "".join(reply_parts)})
                 yield new_messages
                 return
@@ -606,53 +625,113 @@ class AgentRunner:
 
             display_reasoning = "\n\n".join(part for part in (reasoning, content or "") if part).strip()
             if display_reasoning:
-                reasoning_id = _new_event_id("reasoning")
-                yield {"type": "reasoning-start", "id": reasoning_id}
-                yield {
-                    "type": "reasoning-delta",
-                    "id": reasoning_id,
-                    "delta": display_reasoning,
-                }
-                yield {"type": "reasoning-end", "id": reasoning_id}
+                reasoning_id = new_event_id("reasoning")
+                yield make_agent_event(
+                    kind="reasoning.started",
+                    source="agent",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"partId": reasoning_id},
+                )
+                yield make_agent_event(
+                    kind="reasoning.delta",
+                    source="agent",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"partId": reasoning_id, "delta": display_reasoning},
+                )
+                yield make_agent_event(
+                    kind="reasoning.finished",
+                    source="agent",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"partId": reasoning_id},
+                )
 
             for tc in msg.tool_calls:
                 try:
                     args = json.loads(tc.function.arguments or "{}")
                 except Exception:
                     args = {"_raw": tc.function.arguments}
-                yield {"type": "tool-input-start", "toolCallId": tc.id, "toolName": tc.function.name}
-                yield {
-                    "type": "tool-input-delta",
-                    "toolCallId": tc.id,
-                    "inputTextDelta": _tool_input_text(args),
-                }
-                yield {
-                    "type": "tool-input-available",
-                    "toolCallId": tc.id,
-                    "toolName": tc.function.name,
-                    "input": args,
-                }
+                yield make_agent_event(
+                    kind="tool.call.started",
+                    source="tool",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"toolCallId": tc.id, "toolName": tc.function.name},
+                )
+                yield make_agent_event(
+                    kind="tool.call.arguments",
+                    source="tool",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={
+                        "toolCallId": tc.id,
+                        "toolName": tc.function.name,
+                        "inputTextDelta": _tool_input_text(args),
+                        "input": args,
+                    },
+                )
 
             # 执行工具
             for tid, _name, result in await self._run_tool_batch(msg.tool_calls):
                 new_messages.append({"role": "tool", "tool_call_id": tid, "content": result})
-                yield {
-                    "type": "tool-output-available",
-                    "toolCallId": tid,
-                    "output": _tool_output_payload(result),
-                }
-            yield {"type": "finish-step", "finishReason": "tool-calls"}
+                yield make_agent_event(
+                    kind="tool.call.finished",
+                    source="tool",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={
+                        "toolCallId": tid,
+                        "toolName": _name,
+                        "output": _tool_output_payload(result),
+                    },
+                )
+            yield make_agent_event(
+                kind="step.finished",
+                source="agent",
+                conversation_id=conversation_id,
+                message_id=message_id,
+                step_id=step_id,
+                payload={"finishReason": "tool-calls"},
+            )
 
         # 超过最大轮次，强制流式输出（不带 tools）
-        yield {"type": "start-step"}
+        step_id = new_event_id("step")
+        yield make_agent_event(
+            kind="step.started",
+            source="agent",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            step_id=step_id,
+        )
         reply_parts: list[str] = []
-        async for event in self._stream_reply(messages + new_messages, use_tools=False):
-            if event["type"] == "text-delta":
-                reply_parts.append(event["delta"])
+        async for event in self._stream_reply(
+            messages + new_messages,
+            use_tools=False,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            step_id=step_id,
+        ):
+            if event["kind"] == "text.delta":
+                reply_parts.append(str(event["payload"].get("delta") or ""))
                 if self._hook:
-                    await self._hook.on_stream_token(event["delta"])
+                    await self._hook.on_stream_token(str(event["payload"].get("delta") or ""))
             yield event
-        yield {"type": "finish-step", "finishReason": "stop"}
+        yield make_agent_event(
+            kind="step.finished",
+            source="agent",
+            conversation_id=conversation_id,
+            message_id=message_id,
+            step_id=step_id,
+            payload={"finishReason": "stop"},
+        )
         new_messages.append({"role": "assistant", "content": "".join(reply_parts)})
         yield new_messages
 
@@ -660,7 +739,10 @@ class AgentRunner:
         self,
         messages: list[dict],
         use_tools: bool = False,
-    ) -> AsyncGenerator[StreamEvent, None]:
+        conversation_id: str = "",
+        message_id: str = "",
+        step_id: str = "",
+    ) -> AsyncGenerator[AgentEvent, None]:
         """
         以 stream=True 请求 LLM，逐 delta yield 结构化事件。
         """
@@ -693,16 +775,30 @@ class AgentRunner:
         active_reasoning_id: str | None = None
         active_text_id: str | None = None
 
-        async def _close_text_if_needed() -> AsyncGenerator[StreamEvent, None]:
+        async def _close_text_if_needed() -> AsyncGenerator[AgentEvent, None]:
             nonlocal active_text_id
             if active_text_id is not None:
-                yield {"type": "text-end", "id": active_text_id}
+                yield make_agent_event(
+                    kind="text.finished",
+                    source="agent",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"partId": active_text_id},
+                )
                 active_text_id = None
 
-        async def _close_reasoning_if_needed() -> AsyncGenerator[StreamEvent, None]:
+        async def _close_reasoning_if_needed() -> AsyncGenerator[AgentEvent, None]:
             nonlocal active_reasoning_id
             if active_reasoning_id is not None:
-                yield {"type": "reasoning-end", "id": active_reasoning_id}
+                yield make_agent_event(
+                    kind="reasoning.finished",
+                    source="agent",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"partId": active_reasoning_id},
+                )
                 active_reasoning_id = None
 
         async for chunk in stream:
@@ -715,13 +811,23 @@ class AgentRunner:
                 async for event in _close_text_if_needed():
                     yield event
                 if active_reasoning_id is None:
-                    active_reasoning_id = _new_event_id("reasoning")
-                    yield {"type": "reasoning-start", "id": active_reasoning_id}
-                yield {
-                    "type": "reasoning-delta",
-                    "id": active_reasoning_id,
-                    "delta": reasoning_text,
-                }
+                    active_reasoning_id = new_event_id("reasoning")
+                    yield make_agent_event(
+                        kind="reasoning.started",
+                        source="agent",
+                        conversation_id=conversation_id,
+                        message_id=message_id,
+                        step_id=step_id,
+                        payload={"partId": active_reasoning_id},
+                    )
+                yield make_agent_event(
+                    kind="reasoning.delta",
+                    source="agent",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"partId": active_reasoning_id, "delta": reasoning_text},
+                )
 
             content_text = _extract_content_text(delta)
             if not content_text:
@@ -734,21 +840,45 @@ class AgentRunner:
                     async for event in _close_text_if_needed():
                         yield event
                     if active_reasoning_id is None:
-                        active_reasoning_id = _new_event_id("reasoning")
-                        yield {"type": "reasoning-start", "id": active_reasoning_id}
-                    yield {
-                        "type": "reasoning-delta",
-                        "id": active_reasoning_id,
-                        "delta": piece,
-                    }
+                        active_reasoning_id = new_event_id("reasoning")
+                        yield make_agent_event(
+                            kind="reasoning.started",
+                            source="agent",
+                            conversation_id=conversation_id,
+                            message_id=message_id,
+                            step_id=step_id,
+                            payload={"partId": active_reasoning_id},
+                        )
+                    yield make_agent_event(
+                        kind="reasoning.delta",
+                        source="agent",
+                        conversation_id=conversation_id,
+                        message_id=message_id,
+                        step_id=step_id,
+                        payload={"partId": active_reasoning_id, "delta": piece},
+                    )
                     continue
 
                 async for event in _close_reasoning_if_needed():
                     yield event
                 if active_text_id is None:
-                    active_text_id = _new_event_id("text")
-                    yield {"type": "text-start", "id": active_text_id}
-                yield {"type": "text-delta", "id": active_text_id, "delta": piece}
+                    active_text_id = new_event_id("text")
+                    yield make_agent_event(
+                        kind="text.started",
+                        source="agent",
+                        conversation_id=conversation_id,
+                        message_id=message_id,
+                        step_id=step_id,
+                        payload={"partId": active_text_id},
+                    )
+                yield make_agent_event(
+                    kind="text.delta",
+                    source="agent",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"partId": active_text_id, "delta": piece},
+                )
 
         for kind, piece in content_filter.flush():
             if not piece:
@@ -757,21 +887,45 @@ class AgentRunner:
                 async for event in _close_text_if_needed():
                     yield event
                 if active_reasoning_id is None:
-                    active_reasoning_id = _new_event_id("reasoning")
-                    yield {"type": "reasoning-start", "id": active_reasoning_id}
-                yield {
-                    "type": "reasoning-delta",
-                    "id": active_reasoning_id,
-                    "delta": piece,
-                }
+                    active_reasoning_id = new_event_id("reasoning")
+                    yield make_agent_event(
+                        kind="reasoning.started",
+                        source="agent",
+                        conversation_id=conversation_id,
+                        message_id=message_id,
+                        step_id=step_id,
+                        payload={"partId": active_reasoning_id},
+                    )
+                yield make_agent_event(
+                    kind="reasoning.delta",
+                    source="agent",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"partId": active_reasoning_id, "delta": piece},
+                )
                 continue
 
             async for event in _close_reasoning_if_needed():
                 yield event
             if active_text_id is None:
-                active_text_id = _new_event_id("text")
-                yield {"type": "text-start", "id": active_text_id}
-            yield {"type": "text-delta", "id": active_text_id, "delta": piece}
+                active_text_id = new_event_id("text")
+                yield make_agent_event(
+                    kind="text.started",
+                    source="agent",
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    step_id=step_id,
+                    payload={"partId": active_text_id},
+                )
+            yield make_agent_event(
+                kind="text.delta",
+                source="agent",
+                conversation_id=conversation_id,
+                message_id=message_id,
+                step_id=step_id,
+                payload={"partId": active_text_id, "delta": piece},
+            )
 
         async for event in _close_reasoning_if_needed():
             yield event

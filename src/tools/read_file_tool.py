@@ -1,5 +1,5 @@
 """
-tools/file_reader.py — 纯文本文件读取工具
+tools/read_file_tool.py — 纯文本文件读取工具
 
 【仅支持可按指定编码解码的文本文件】：.txt / .md / .log / .json / .yaml / .csv /
 .py / .sh 等。若文件以指定编码解码失败，会提示尝试其他编码或改用 run_command 处理。
@@ -20,6 +20,8 @@ tools/file_reader.py — 纯文本文件读取工具
 import re
 from pathlib import Path
 from typing import Optional
+
+from tools.base import Tool
 
 # 常见纯文本扩展名（仅用于友好提示，不作强制拦截）
 _TEXT_EXTENSIONS = {
@@ -236,3 +238,52 @@ def read_file(
                 result = f"{header_text}{note}"
 
     return result
+
+
+class ReadFileTool(Tool):
+    @property
+    def name(self) -> str:
+        return "read_file"
+
+    @property
+    def description(self) -> str:
+        return (
+            "读取本地【纯文本】文件内容。"
+            "支持全文读取、行范围、关键词过滤、上下文与字符截断。"
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return FILE_READER_TOOLS[0]["function"]["parameters"]
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def concurrency_safe(self) -> bool:
+        return True
+
+    @property
+    def allow_spill(self) -> bool:
+        return False
+
+    async def execute(
+        self,
+        path: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        pattern: Optional[str] = None,
+        context_lines: int = 0,
+        encoding: str = "utf-8",
+        max_chars: Optional[int] = None,
+    ) -> str:
+        return read_file(
+            path=path,
+            start_line=start_line,
+            end_line=end_line,
+            pattern=pattern,
+            context_lines=context_lines,
+            encoding=encoding,
+            max_chars=max_chars,
+        )

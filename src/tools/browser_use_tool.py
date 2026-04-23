@@ -17,6 +17,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+from tools.base import Tool
+
 # ── OpenAI function-calling schema ────────────────────────────────────────────
 
 BROWSER_TOOLS: list[dict] = [
@@ -184,3 +186,46 @@ class BrowserAgent:
     @property
     def is_initialized(self) -> bool:
         return self._initialized
+
+
+class BrowserUseTool(Tool):
+    def __init__(self, browser_agent: BrowserAgent):
+        self._browser_agent = browser_agent
+
+    @property
+    def name(self) -> str:
+        return "browser_use"
+
+    @property
+    def description(self) -> str:
+        return (
+            "使用 AI 驱动的浏览器自动化执行网页操作任务。"
+            "只需用自然语言描述要做的事，浏览器 Agent 会自主完成：\n"
+            "  - 打开网页、点击按钮、填写表单\n"
+            "  - 提取页面内容、截图\n"
+            "  - 多步骤复杂操作（如搜索比价、填写申请等）\n"
+            "适合需要真实浏览器交互的场景，比 web_search 更强大但更慢，"
+            "**只有操作必须通过操作浏览器完成时才使用**。"
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return BROWSER_TOOLS[0]["function"]["parameters"]
+
+    @property
+    def exclusive(self) -> bool:
+        return True
+
+    async def execute(self, task: str) -> str:
+        result = await self._browser_agent.run_task(task=task)
+
+        if not result.get("success"):
+            return f"[浏览器操作失败] {result.get('error', '未知错误')}"
+
+        parts = []
+        if result.get("result"):
+            parts.append(result["result"])
+        if result.get("steps"):
+            parts.append(f"\n（共执行 {result['steps']} 个操作步骤）")
+
+        return "\n".join(parts) if parts else "浏览器任务已完成。"

@@ -59,7 +59,7 @@ from config import Config
 
 if TYPE_CHECKING:
     from agent import Butler
-    from agent.stream_events import StreamEvent
+    from event import StreamEvent
 
 
 # ── AIButlerApp ────────────────────────────────────────────────────────────────

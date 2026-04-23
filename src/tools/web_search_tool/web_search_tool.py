@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import asyncio
 
-from tools.search_engine import choose_engine, run_search
+from tools.base import Tool
+from tools.web_search_tool.search_engine import choose_engine, run_search
 
 # ── OpenAI function-calling schema ────────────────────────────────────────────
 
@@ -97,3 +98,43 @@ async def web_search(
 
     lines.append(f"\n（共返回 {len(results)} 条结果）")
     return "\n".join(lines)
+
+
+class WebSearchTool(Tool):
+    @property
+    def name(self) -> str:
+        return "web_search"
+
+    @property
+    def description(self) -> str:
+        return (
+            "搜索互联网获取实时信息。"
+            "用于查询新闻、天气、价格、最新资讯等训练数据截止后的内容。"
+            "支持百度和 Bing 国际版。"
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return SEARCH_TOOLS[0]["function"]["parameters"]
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    @property
+    def concurrency_safe(self) -> bool:
+        return True
+
+    async def execute(
+        self,
+        query: str,
+        engine: str = "auto",
+        max_results: int = 5,
+        proxy: str | None = None,
+    ) -> str:
+        return await web_search(
+            query=query,
+            engine=engine,
+            max_results=max_results,
+            proxy=proxy,
+        )
