@@ -13,7 +13,6 @@ workspace/
 
 # Git
 .git/
-.gitmodules
 
 # IDE
 .vscode/
