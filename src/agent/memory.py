@@ -71,26 +71,38 @@ class MemoryManager:
     async def create(
         cls,
         memory_dir: str,
-        llm_api_key: str,
-        llm_base_url: str,
-        llm_model: str,
         emb_api_key: str,
         emb_base_url: str,
         emb_model: str,
+        chat_provider: Any | None = None,
+        llm_api_key: str = "",
+        llm_base_url: str = "",
+        llm_model: str = "",
         similarity_threshold: float = 0.5,
     ) -> "MemoryManager":
         """
         工厂方法：初始化 ReMe 并返回可用的 MemoryManager 实例。
         """
         from reme.reme_light import ReMeLight
+        if chat_provider is not None:
+            model_config = chat_provider.export_model_config()
+            llm_kwargs = {
+                "llm_api_key": model_config.api_key,
+                "llm_base_url": model_config.base_url,
+                "default_as_llm_config": {"model_name": model_config.model},
+            }
+        else:
+            llm_kwargs = {
+                "llm_api_key": llm_api_key,
+                "llm_base_url": llm_base_url,
+                "default_as_llm_config": {"model_name": llm_model},
+            }
 
         reme = ReMeLight(
             working_dir=memory_dir,
-            llm_api_key=llm_api_key,
-            llm_base_url=llm_base_url,
+            **llm_kwargs,
             embedding_api_key=emb_api_key,
             embedding_base_url=emb_base_url,
-            default_as_llm_config={"model_name": llm_model},
             default_embedding_model_config={"model_name": emb_model},
             default_file_store_config={"fts_enabled": True, "vector_enabled": True},
             enable_load_env=False,

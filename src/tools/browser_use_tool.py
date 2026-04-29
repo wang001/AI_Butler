@@ -57,8 +57,10 @@ class BrowserUseConfig:
     headless: bool = True
     # browser-use Agent 最大操作步数（防止无限循环）
     max_steps: int = 20
+    # 默认从当前 Agent provider 导出的模型配置创建 browser-use LLM
+    model_config: Any | None = None
     # 浏览器使用的 LLM（复用 AI Butler 的 LLM 配置）
-    # 格式: openai 兼容，通过 ChatOpenAI 传入
+    # 下面三项仅作为历史兼容 fallback。
     llm_model: str = ""
     llm_base_url: str = ""
     llm_api_key: str = ""
@@ -99,11 +101,17 @@ class BrowserAgent:
     def _create_llm(self):
         """创建供 browser-use Agent 使用的 LLM 实例。
 
-        browser-use >=0.12 要求 LLM 实现其自己的 BaseChatModel 协议（含 provider 属性），
-        langchain_openai.ChatOpenAI 不满足，改用 browser_use.llm.litellm.ChatLiteLLM，
-        通过 'openai/<model>' 前缀 + api_base 连接任意 OpenAI 兼容端点。
+        browser-use >=0.12 要求 LLM 实现其自己的 BaseChatModel 协议。
+        默认使用当前 Agent provider 导出的模型配置，确保接入配置来源一致。
         """
         from browser_use.llm.litellm.chat import ChatLiteLLM
+
+        if self.config.model_config is not None:
+            return ChatLiteLLM(
+                model=self.config.model_config.litellm_model,
+                api_key=self.config.model_config.api_key,
+                api_base=self.config.model_config.base_url,
+            )
 
         return ChatLiteLLM(
             model=f"openai/{self.config.llm_model}",

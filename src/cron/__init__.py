@@ -12,9 +12,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from openai import AsyncOpenAI
-
 from agent.runner import AgentRunner
+from provider import build_chat_provider
 from tools.executor import ToolExecutor
 from tools.memory_tools import MemoryTools, SearchHistoryTool, SearchMemoryTool
 from tools.registry import ToolRegistry
@@ -55,6 +54,7 @@ class MemoryUpdateService:
         self._history = history
         self._reme = reme
         self._llm_model = llm_model
+        self._provider = build_chat_provider(cfg, model=llm_model)
         self._memory_dir = Path(cfg.memory_dir)
         self._memory_path = self._memory_dir / "MEMORY.md"
         self._meta_path = self._memory_dir / ".memory_update_meta.json"
@@ -342,15 +342,13 @@ class MemoryUpdateService:
         )
 
     async def _generate_memory(self, prompt: str) -> str:
-        llm = AsyncOpenAI(base_url=self._cfg.llm_base_url, api_key=self._cfg.llm_api_key)
         dispatcher = _MemoryOnlyDispatcher(
             reme=self._reme,
             history=self._history,
             memory_update_service=self,
         )
         runner = AgentRunner(
-            llm=llm,
-            model=self._llm_model,
+            provider=self._provider,
             dispatcher=dispatcher,
             hook=None,
         )

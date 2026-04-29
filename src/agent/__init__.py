@@ -29,13 +29,12 @@ import warnings
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, TYPE_CHECKING
 
-from openai import AsyncOpenAI
-
 from agent.hooks import AgentHook, CompositeHook
 from agent.memory import MemoryManager
 from agent.context import ContextBuilder
 from agent.runner import AgentRunner
 from event import StreamEvent, make_agent_event, to_stream_events
+from provider import build_chat_provider
 
 if TYPE_CHECKING:
     from config import Config
@@ -143,16 +142,14 @@ class Butler:
         src_dir = Path(__file__).parent.parent
         system_prompt = (src_dir / "prompts" / "system.txt").read_text(encoding="utf-8")
 
-        llm = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key)
+        provider = build_chat_provider(cfg, model=cfg.llm_model)
 
         memory = await MemoryManager.create(
             memory_dir=cfg.memory_dir,
-            llm_api_key=cfg.llm_api_key,
-            llm_base_url=cfg.llm_base_url,
-            llm_model=cfg.llm_model,
             emb_api_key=cfg.emb_api_key,
             emb_base_url=cfg.emb_base_url,
             emb_model=cfg.emb_model,
+            chat_provider=provider,
             similarity_threshold=cfg.memory_similarity_threshold,
         )
 
@@ -186,9 +183,7 @@ class Butler:
                 browser_agent = BrowserAgent(BrowserUseConfig(
                     headless=cfg.browser_headless,
                     max_steps=cfg.browser_max_steps,
-                    llm_model=cfg.llm_model,
-                    llm_base_url=cfg.llm_base_url,
-                    llm_api_key=cfg.llm_api_key,
+                    model_config=provider.export_model_config(),
                 ))
             except Exception:
                 pass
@@ -204,8 +199,7 @@ class Butler:
         )
 
         runner = AgentRunner(
-            llm=llm,
-            model=cfg.llm_model,
+            provider=provider,
             dispatcher=dispatcher,
             hook=hook,
         )

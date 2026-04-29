@@ -1,5 +1,5 @@
 reme-ai[light]>=0.3.0
-openai>=1.30.0
+openai>=2.16.0
 python-dotenv>=1.0.0
 tiktoken>=0.7.0
 prompt_toolkit>=3.0.0
